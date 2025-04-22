@@ -4,7 +4,7 @@ import os
 import sys
 from time import time
 
-import yadisk
+from yadisk import AsyncClient
 from dotenv import load_dotenv
 from yadisk.objects import ResourceObject, DiskInfoObject
 from pathlib import Path
@@ -29,14 +29,18 @@ async def main(email: str):
 
     token = ''
     try:
-        service_apps_client: ServiceAppClient = ServiceAppClient(os.getenv('CLIENT_ID'), os.getenv('CLIENT_SECRET'))
+        client_id = os.getenv('CLIENT_ID')
+        client_secret = os.getenv('CLIENT_SECRET')
+        if not client_id or not client_secret:
+            raise Exception('CLIENT_ID or CLIENT_SECRET is not in environment or .env file')
+        service_apps_client: ServiceAppClient = ServiceAppClient(client_id, client_secret)
         token = service_apps_client.get_service_app_token(subject_token=email).access_token
     except Exception as e:
         log.error('Error getting service app token')
         log.error(e)
         exit(1)
 
-    client = yadisk.AsyncClient(token=token)
+    client = AsyncClient(token=token)
 
     async with client:
         if await client.check_token():
@@ -90,7 +94,7 @@ async def main(email: str):
         log.info(f'Downloaded {len(files)} files in {round((end_time - start_time) / 60, 2)} minutes')
 
 
-async def download_file(client: yadisk.AsyncClient, path, email, file_position_of):
+async def download_file(client: AsyncClient, path, email, file_position_of):
     # log.info(f'Downloading file {file_position_of}: {path}')
     await client.download(path, f'{email}{path}')
     log.info(f'Downloaded file {file_position_of}: {path}')
@@ -100,7 +104,7 @@ async def safe_download(*args, **kwargs):
     async with sem:  # semaphore limits num of simultaneous downloads
         return await download_file(*args, **kwargs)
 
-async def process_directories(client: yadisk.AsyncClient, directories_list: list[ResourceObject]):
+async def process_directories(client: AsyncClient, directories_list: list[ResourceObject]):
     if len(directories_list) > 0:
         # log.debug(f'Starting to process {len(directories_list)} directories')
 
@@ -124,7 +128,7 @@ async def list_directory(client, path):
     directories.extend(directories_list)
     await process_directories(client, directories_list)
 
-async def list_files(client: yadisk.AsyncClient) -> list[ResourceObject]:
+async def list_files(client: AsyncClient) -> list[ResourceObject]:
     files_list: list[ResourceObject] = []
     async for item in client.listdir('/'):
         if item.type == 'file':
