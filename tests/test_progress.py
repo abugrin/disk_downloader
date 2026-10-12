@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from token_fixtures import make_token
 
 
 class StatusObserver(logging.Handler):
@@ -65,7 +66,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         def token(client_id, client_secret, email):
             nonlocal auth_reported
             auth_reported = observer.events['auth'].wait(2)
-            return 'test-token'
+            return make_token()
 
         async def wait_for_status(name):
             self.assertTrue(await asyncio.to_thread(observer.events[name].wait, 2), name)
@@ -129,7 +130,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             patch.object(downloader, 'AsyncClient', return_value=client),
             self.assertLogs('Downloader'),
         ):
-            service.return_value = 'test-token'
+            service.return_value = make_token()
             downloader.log.addHandler(observer)
             task = asyncio.create_task(downloader.main('test@example.invalid', status_interval=0.01))
             try:
@@ -164,7 +165,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'get_service_token', return_value='test-token'),
+            patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'AsyncClient', return_value=client),
             patch.object(downloader.asyncio, 'sleep', side_effect=wait_for_status),
             self.assertLogs('Downloader') as logs,

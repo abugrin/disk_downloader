@@ -19,6 +19,7 @@ import re
 import sys
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -39,6 +40,9 @@ from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 MAX_STREAMS = 10
 STATUS_INTERVAL = 10.0
+TOKEN_LIFETIME = 3600.0
+TOKEN_REFRESH_MARGIN = 300.0
+TOKEN_REFRESH_RETRY_INTERVAL = 30.0
 RETRY_DELAYS = (2, 4, 8, 16, 32)
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 NETWORK_ERRORS = (
@@ -120,9 +124,17 @@ async def check_transient_response(response: httpx.Response) -> None:
         response.raise_for_status()
 
 
-async def get_service_token(client_id: str, client_secret: str, email: str) -> str:
+@dataclass(frozen=True)
+class ServiceToken:
+    access_token: str = field(repr=False)
+    expires_at: float
+    refresh_at: float
+
+
+async def get_service_token(client_id: str, client_secret: str, email: str) -> ServiceToken:
     async with httpx.AsyncClient(timeout=30) as client:
-        async def request() -> str:
+        async def request() -> ServiceToken:
+            started = monotonic()
             response = await client.post('https://oauth.yandex.ru/token', data={
                 'grant_type': 'urn:ietf:params:oauth:grant-type:token-exchange',
                 'client_id': client_id,
@@ -131,12 +143,109 @@ async def get_service_token(client_id: str, client_secret: str, email: str) -> s
                 'subject_token_type': 'urn:yandex:params:oauth:token-type:email',
             })
             response.raise_for_status()
-            token = response.json()['access_token']
+            payload = response.json()
+            token = payload['access_token']
             if not isinstance(token, str) or not token:
                 raise ValueError('Invalid service app token response')
-            return token
+            lifetime = payload.get('expires_in', TOKEN_LIFETIME)
+            if isinstance(lifetime, bool):
+                raise ValueError('Invalid service app token lifetime')
+            try:
+                lifetime = float(lifetime)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('Invalid service app token lifetime') from None
+            if not math.isfinite(lifetime) or lifetime <= 0:
+                raise ValueError('Invalid service app token lifetime')
+            expires_at = started + lifetime
+            if expires_at <= monotonic():
+                raise ValueError('Service app token has already expired')
+            return ServiceToken(token, expires_at, expires_at - min(TOKEN_REFRESH_MARGIN, lifetime * 0.1))
 
         return await with_retries(request, 'получение токена')
+
+
+class TokenRefreshError(Exception):
+    pass
+
+
+class ServiceTokenManager:
+    def __init__(self, client_id: str, client_secret: str, email: str):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._email = email
+        self._token: ServiceToken | None = None
+        self._next_refresh_at = 0.0
+        self._lock = asyncio.Lock()
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> 'ServiceTokenManager':
+        await self.get_token()
+        self._task = asyncio.create_task(self._run(), name='downloader-token-refresh')
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self._stop.set()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._task = None
+
+    async def get_token(self) -> str:
+        async with self._lock:
+            now = monotonic()
+            if now < self._next_refresh_at:
+                if self._token is not None and now < self._token.expires_at:
+                    return self._token.access_token
+                raise TokenRefreshError('Нет действующего сервисного токена')
+            refreshing = self._token is not None
+            if refreshing:
+                log.info('Обновление сервисного токена...')
+            try:
+                token = await get_service_token(self._client_id, self._client_secret, self._email)
+            except Exception as error:
+                self._next_refresh_at = monotonic() + TOKEN_REFRESH_RETRY_INTERVAL
+                if refreshing:
+                    log.warning('Не удалось обновить сервисный токен (%s); следующая проверка через %.0f с',
+                                type(error).__name__, TOKEN_REFRESH_RETRY_INTERVAL)
+                if self._token is not None and monotonic() < self._token.expires_at:
+                    return self._token.access_token
+                raise TokenRefreshError('Нет действующего сервисного токена') from None
+            self._token = token
+            self._next_refresh_at = token.refresh_at
+            log.info('Сервисный токен %s; обновление через %.0f с',
+                     'обновлён' if refreshing else 'получен', max(0, token.refresh_at - monotonic()))
+            return token.access_token
+
+    async def authorize(self, request: httpx.Request) -> None:
+        if request.headers.get('Authorization', '').startswith('OAuth '):
+            request.headers['Authorization'] = f'OAuth {await self.get_token()}'
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=max(0, self._next_refresh_at - monotonic()))
+                return
+            except TimeoutError:
+                pass
+            try:
+                await self.get_token()
+            except TokenRefreshError:
+                pass
+
+
+def disk_session(tokens: ServiceTokenManager | None = None) -> AsyncHTTPXSession:
+    hooks = {'response': [check_transient_response]}
+    if tokens is not None:
+        hooks['request'] = [tokens.authorize]
+    return AsyncHTTPXSession(event_hooks=hooks)
 
 
 async def directory_items(client: AsyncClient, path: str) -> list[ResourceObject]:
@@ -147,9 +256,9 @@ async def directory_items(client: AsyncClient, path: str) -> list[ResourceObject
 
 
 class SharedDiskClient(AsyncClient):
-    def __init__(self, token: str, vdhash: str):
+    def __init__(self, token: str, vdhash: str, tokens: ServiceTokenManager | None = None):
         self.vdhash = validate_vdhash(vdhash)
-        session = AsyncHTTPXSession(event_hooks={'response': [check_transient_response]})
+        session = disk_session(tokens)
         self.http = session.httpx_session
         super().__init__(token=token, session=session, default_args={
             'n_retries': 0, 'headers': {'Authorization': f'OAuth {token}'},
@@ -473,18 +582,19 @@ async def download_user(
         client_id, client_secret = load_credentials()
         if not client_id or not client_secret:
             raise ValueError('CLIENT_ID or CLIENT_SECRET is not in environment or .env file')
-        token = await get_service_token(client_id, client_secret, email)
+        tokens = ServiceTokenManager(client_id, client_secret, email)
+        token = await tokens.get_token()
     except Exception as error:
         log.error('Error getting service app token (%s)', type(error).__name__)
         return False
 
     if vdhash is not None:
-        client = SharedDiskClient(token, vdhash)
+        client = SharedDiskClient(token, vdhash, tokens)
     else:
-        session = AsyncHTTPXSession(event_hooks={'response': [check_transient_response]})
+        session = disk_session(tokens)
         client = AsyncClient(token=token, session=session, default_args={'n_retries': 0})
 
-    async with client:
+    async with client, tokens:
         progress.phase('проверка токена')
         if await with_retries(client.check_token, 'проверка токена'):
             log.info('Test service app token: Success')

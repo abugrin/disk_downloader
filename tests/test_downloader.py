@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from token_fixtures import make_token
 
 
 class LocalPathTests(unittest.TestCase):
@@ -106,7 +107,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
             patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
         ):
-            service.return_value = 'test-token'
+            service.return_value = make_token()
             await downloader.main(self.email)
         return client
 

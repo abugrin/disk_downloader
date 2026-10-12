@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from dotenv import dotenv_values
 
 import downloader
+from token_fixtures import make_token
 
 
 class MenuTests(unittest.TestCase):
@@ -162,7 +163,7 @@ class MenuTests(unittest.TestCase):
             patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
             self.answers('select', ['user', 'user', 'exit']),
             self.answers('text', ['user@example.invalid', 'user@example.invalid']),
-            patch.object(downloader, 'get_service_token', return_value='test-token'),
+            patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'AsyncClient', side_effect=client_factory),
             self.assertLogs('Downloader'),
         ):

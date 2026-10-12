@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from token_fixtures import make_token
 
 
 class CsvTests(unittest.TestCase):
@@ -144,7 +145,7 @@ class BatchTests(unittest.TestCase):
         def token(client_id, client_secret, email):
             if email == users[0]:
                 raise RuntimeError('secret-must-not-be-logged')
-            return email
+            return make_token(email)
 
         with (
             patch('builtins.input', side_effect=AssertionError('CSV launch must not prompt')),
@@ -181,7 +182,7 @@ class BatchTests(unittest.TestCase):
             patch.object(downloader, 'AsyncClient', side_effect=lambda token, **kwargs: clients[token]),
             self.assertLogs('Downloader') as logs,
         ):
-            service.side_effect = lambda client_id, client_secret, email: email
+            service.side_effect = lambda client_id, client_secret, email: make_token(email)
             self.assertEqual(downloader.cli(['--csv', 'users.csv']), 0)
         files = list(Path.cwd().glob('*/same.txt'))
         self.assertEqual(len(files), 2)
