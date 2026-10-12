@@ -1,0 +1,14 @@
+[project]
+name = "yandex-disk-downloader"
+version = "0.1.0"
+description = "Download an organization user's Yandex Disk with portable local paths"
+readme = "README.MD"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "python-dotenv>=1.1,<2",
+    "y360-orglib==0.0.5",
+    "yadisk[async-defaults]==3.2.0",
+]
+
+[tool.uv]
+package = false
