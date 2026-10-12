@@ -1,5 +1,6 @@
 .env
 .env.*
+.env-*
 !.env.example
 
 .venv/
@@ -15,9 +16,11 @@ dist/
 
 /*@*/
 /downloads/
+/shared/
 *.log
 *.csv
 !users.example.csv
+!shared-disks.example.csv
 
 .idea/
 .vscode/

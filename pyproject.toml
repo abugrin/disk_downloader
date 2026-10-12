@@ -5,8 +5,9 @@ description = "Download an organization user's Yandex Disk with portable local p
 readme = "README.MD"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "httpx>=0.28,<0.29",
     "python-dotenv>=1.1,<2",
-    "y360-orglib==0.0.5",
+    "questionary>=2.1,<3",
     "yadisk[async-defaults]==3.2.0",
 ]
 

@@ -103,10 +103,10 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'ServiceAppClient') as service,
+            patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
         ):
-            service.return_value.get_service_app_token.return_value.access_token = 'test-token'
+            service.return_value = 'test-token'
             await downloader.main(self.email)
         return client
 
@@ -200,15 +200,12 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         files = [('file', 'disk:/A?.txt'), ('file', 'disk:/A*.txt'), ('file', 'disk:/a_.TXT')]
         mappings = []
         for ordered in [files, list(reversed(files))]:
-            mapping = {}
-
             async def download(remote, local):
-                mapping[remote] = Path(local).name
                 Path(local).write_text(remote)
 
             with self.assertLogs('Downloader'):
                 await self.run_main({'/': ordered}, download)
-            mappings.append(mapping)
+            mappings.append({p.read_text(): p.name for p in Path(self.email).iterdir()})
         self.assertEqual(mappings[0], mappings[1])
         self.assertEqual(len({name.casefold() for name in mappings[0].values()}), 3)
 
@@ -242,7 +239,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'ServiceAppClient', side_effect=RuntimeError('secret-must-not-be-logged')),
+            patch.object(downloader, 'get_service_token', side_effect=RuntimeError('secret-must-not-be-logged')),
             patch.object(downloader, 'AsyncClient') as client,
             self.assertLogs('Downloader') as logs,
         ):

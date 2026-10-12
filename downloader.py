@@ -1,3 +1,13 @@
+# /// script
+# requires-python = ">=3.13,<3.14"
+# dependencies = [
+#     "httpx>=0.28,<0.29",
+#     "python-dotenv>=1.1,<2",
+#     "questionary>=2.1,<3",
+#     "yadisk[async-defaults]==3.2.0",
+# ]
+# ///
+
 import argparse
 import asyncio
 import csv
@@ -8,19 +18,34 @@ import os
 import re
 import sys
 import unicodedata
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from random import uniform
+from tempfile import NamedTemporaryFile
 from threading import Event, Lock, Thread
 from time import monotonic, time
 from types import TracebackType
 
-from dotenv import load_dotenv
-from y360_orglib import ServiceAppClient
+import httpx
+import questionary
+from dotenv import load_dotenv, set_key
 from yadisk import AsyncClient
+from yadisk.exceptions import RequestTimeoutError, YaDiskConnectionError
 from yadisk.objects import DiskInfoObject, ResourceObject
+from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
 MAX_STREAMS = 10
 STATUS_INTERVAL = 10.0
+RETRY_DELAYS = (2, 4, 8, 16, 32)
+RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+NETWORK_ERRORS = (
+    TimeoutError, ConnectionError, RequestTimeoutError, YaDiskConnectionError,
+    httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+    httpx.ProxyError, httpx.DecodingError,
+)
 directories: list[ResourceObject] = []
 
 log = logging.getLogger('Downloader')
@@ -38,6 +63,156 @@ RESERVED_NAMES = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'} | {
 }
 MAX_NAME_BYTES = 240
 EMAIL_PATTERN = re.compile(r'[^@\s<>"/\\,;\x00-\x1f\x7f]+@[^@\s<>"/\\,;\x00-\x1f\x7f]+')
+
+
+def retry_after_seconds(value: str | None) -> float:
+    if value is None:
+        return 0.0
+    value = value.strip()
+    try:
+        if re.fullmatch(r'[0-9]+', value):
+            delay = float(value)
+        else:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            delay = date.timestamp() - time()
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+    return max(0.0, delay) if math.isfinite(delay) else 0.0
+
+
+def retry_details(error: Exception) -> tuple[bool, float, str]:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    network_error = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, 'response', None)
+        status = getattr(response, 'status_code', getattr(response, 'status', None))
+        if status is not None:
+            headers = getattr(response, 'headers', {})
+            return status in RETRY_STATUSES, retry_after_seconds(headers.get('Retry-After')), f'HTTP {status}'
+        network_error |= isinstance(current, NETWORK_ERRORS)
+        current = current.__cause__
+    return network_error, 0.0, type(error).__name__
+
+
+async def with_retries[T](operation: Callable[[], Awaitable[T]], label: str) -> T:
+    attempt = 0
+    while True:
+        try:
+            return await operation()
+        except Exception as error:
+            retryable, retry_after, reason = retry_details(error)
+            if not retryable or attempt == len(RETRY_DELAYS):
+                raise
+            base = RETRY_DELAYS[attempt]
+            delay = max(base + uniform(0.0, base * 0.25), retry_after)
+            attempt += 1
+            log.warning('Повтор %s/%s через %.2f с: %s (%s)',
+                        attempt, len(RETRY_DELAYS), delay, label, reason)
+            await asyncio.sleep(delay)
+
+
+async def check_transient_response(response: httpx.Response) -> None:
+    if response.status_code in RETRY_STATUSES:
+        response.raise_for_status()
+
+
+async def get_service_token(client_id: str, client_secret: str, email: str) -> str:
+    async with httpx.AsyncClient(timeout=30) as client:
+        async def request() -> str:
+            response = await client.post('https://oauth.yandex.ru/token', data={
+                'grant_type': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'subject_token': email,
+                'subject_token_type': 'urn:yandex:params:oauth:token-type:email',
+            })
+            response.raise_for_status()
+            token = response.json()['access_token']
+            if not isinstance(token, str) or not token:
+                raise ValueError('Invalid service app token response')
+            return token
+
+        return await with_retries(request, 'получение токена')
+
+
+async def directory_items(client: AsyncClient, path: str) -> list[ResourceObject]:
+    async def request() -> list[ResourceObject]:
+        return [item async for item in client.listdir(path)]
+
+    return await with_retries(request, f'чтение папки {path!r}')
+
+
+class SharedDiskClient(AsyncClient):
+    def __init__(self, token: str, vdhash: str):
+        self.vdhash = validate_vdhash(vdhash)
+        session = AsyncHTTPXSession(event_hooks={'response': [check_transient_response]})
+        self.http = session.httpx_session
+        super().__init__(token=token, session=session, default_args={
+            'n_retries': 0, 'headers': {'Authorization': f'OAuth {token}'},
+        })
+
+    def inner_path(self, path: str) -> str:
+        if path.startswith('vd:'):
+            for prefix in (f'vd:{self.vdhash}:disk:', f'vd:/{self.vdhash}/disk'):
+                if path == prefix or path.startswith(prefix + '/'):
+                    path = path[len(prefix):] or '/'
+                    break
+            else:
+                raise ValueError('Resource belongs to a different shared disk')
+        path = path.removeprefix('disk:')
+        if not path.startswith('/'):
+            raise ValueError('Invalid shared disk resource path')
+        return path
+
+    async def get_json(self, resource: str, params: dict[str, str | int]) -> dict:
+        response = await self.http.get(
+            f'https://cloud-api.yandex.net/v1/disk/{resource}', params=params,
+            headers={'Authorization': f'OAuth {self.token}'}, timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError('Invalid shared disk response')
+        return payload
+
+    async def get_disk_info(self, **kwargs) -> DiskInfoObject:
+        return DiskInfoObject(await self.get_json('virtual-disks', {'vd_hash': self.vdhash}))
+
+    async def listdir(self, path: str, /, **kwargs) -> AsyncIterator[ResourceObject]:
+        offset = 0
+        while True:
+            payload = await self.get_json('virtual-disks/resources', {
+                'path': f'vd:{self.vdhash}:disk:{self.inner_path(path)}',
+                'limit': 500, 'offset': offset, 'sort': 'path',
+            })
+            embedded = payload.get('_embedded')
+            if payload.get('type') != 'dir' or not isinstance(embedded, dict):
+                raise ValueError('Invalid shared disk directory response')
+            items, total = embedded.get('items'), embedded.get('total')
+            if not isinstance(items, list) or type(total) is not int or total < 0:
+                raise ValueError('Invalid shared disk listing')
+            if not items and offset < total:
+                raise ValueError('Incomplete shared disk listing')
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get('path'), str) or item.get('type') not in ('file', 'dir'):
+                    raise ValueError('Invalid shared disk resource')
+                yield ResourceObject({**item, 'path': 'disk:' + self.inner_path(item['path'])})
+            offset += len(items)
+            if offset >= total:
+                break
+
+    async def get_download_link(self, path: str, /, **kwargs) -> str:
+        payload = await self.get_json('virtual-disks/resources/download', {
+            'path': f'vd:{self.vdhash}:disk:{self.inner_path(path)}',
+        })
+        href = payload.get('href')
+        if not isinstance(href, str) or httpx.URL(href).scheme != 'https' or not httpx.URL(href).host:
+            raise ValueError('Invalid shared disk download link')
+        return href
 
 
 class ProgressReporter:
@@ -158,8 +333,18 @@ def validate_email(value: str) -> str:
     return email
 
 
-def read_users_csv(path: Path) -> list[str]:
-    users: list[str] = []
+def validate_vdhash(value: str) -> str:
+    vdhash = value.strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', vdhash):
+        raise ValueError('Invalid VDHASH; use the disk ID from /vd/<VDHASH>/ in its URL')
+    return vdhash
+
+
+def read_csv_values(
+    path: Path, column_name: str, validator: Callable[[str], str],
+    key: Callable[[str], str], empty_label: str,
+) -> list[str]:
+    values: list[str] = []
     seen: set[str] = set()
     with path.open(encoding='utf-8-sig', newline='') as source:
         first_line = next((line for line in source if line.strip()), '')
@@ -169,35 +354,43 @@ def read_users_csv(path: Path) -> list[str]:
         except csv.Error:
             delimiter = ','
         reader = csv.reader(source, delimiter=delimiter, strict=True)
-        email_column: int | None = None
+        value_column: int | None = None
         first_row = True
         for row in reader:
             if not any(cell.strip() for cell in row):
                 continue
             if first_row:
                 first_row = False
-                columns = [cell.strip().casefold() for cell in row]
-                if columns.count('email') > 1:
-                    raise ValueError('CSV contains more than one email column')
-                if 'email' in columns:
-                    email_column = columns.index('email')
+                columns = [cell.strip().casefold().replace('_', '') for cell in row]
+                if columns.count(column_name) > 1:
+                    raise ValueError(f'CSV contains more than one {column_name} column')
+                if column_name in columns:
+                    value_column = columns.index(column_name)
                     continue
-            if email_column is None and len(row) != 1:
-                raise ValueError(f'CSV line {reader.line_num}: expected one email or an email column header')
-            column = email_column if email_column is not None else 0
+            if value_column is None and len(row) != 1:
+                raise ValueError(f'CSV line {reader.line_num}: expected one {column_name} or a {column_name} column header')
+            column = value_column if value_column is not None else 0
             if column >= len(row):
-                raise ValueError(f'CSV line {reader.line_num}: missing email column')
+                raise ValueError(f'CSV line {reader.line_num}: missing {column_name} column')
             try:
-                email = validate_email(row[column])
+                value = validator(row[column])
             except ValueError:
-                raise ValueError(f'CSV line {reader.line_num}: invalid or empty email') from None
-            key = email.casefold()
-            if key not in seen:
-                seen.add(key)
-                users.append(email)
-    if not users:
-        raise ValueError('CSV contains no users')
-    return users
+                raise ValueError(f'CSV line {reader.line_num}: invalid or empty {column_name}') from None
+            identifier = key(value)
+            if identifier not in seen:
+                seen.add(identifier)
+                values.append(value)
+    if not values:
+        raise ValueError(f'CSV contains no {empty_label}')
+    return values
+
+
+def read_users_csv(path: Path) -> list[str]:
+    return read_csv_values(path, 'email', validate_email, str.casefold, 'users')
+
+
+def read_shared_disks_csv(path: Path) -> list[str]:
+    return read_csv_values(path, 'vdhash', validate_vdhash, lambda value: value, 'disks')
 
 
 def shorten_name(name: str, suffix: str = '') -> str:
@@ -259,44 +452,50 @@ def is_excluded(path: str) -> bool:
     return 'Файлы Мессенджера' in path.removeprefix('disk:').strip('/').split('/')
 
 
-async def main(email: str, output_dir: Path | None = None, status_interval: float = STATUS_INTERVAL) -> bool:
-    with ProgressReporter(email, status_interval) as progress:
-        return await download_user(email, output_dir, progress)
+async def main(
+    email: str, output_dir: Path | None = None, status_interval: float = STATUS_INTERVAL,
+    vdhash: str | None = None,
+) -> bool:
+    global sem
+    sem = asyncio.Semaphore(MAX_STREAMS)
+    label = f'Общий Диск {vdhash} ({email})' if vdhash is not None else email
+    with ProgressReporter(label, status_interval) as progress:
+        return await download_user(email, output_dir, progress, vdhash)
 
 
-async def download_user(email: str, output_dir: Path | None, progress: ProgressReporter) -> bool:
-    load_dotenv()
+async def download_user(
+    email: str, output_dir: Path | None, progress: ProgressReporter, vdhash: str | None = None,
+) -> bool:
     start_time = time()
     directories.clear()
 
     try:
-        client_id = os.getenv('CLIENT_ID')
-        client_secret = os.getenv('CLIENT_SECRET')
+        client_id, client_secret = load_credentials()
         if not client_id or not client_secret:
             raise ValueError('CLIENT_ID or CLIENT_SECRET is not in environment or .env file')
-        service_apps_client: ServiceAppClient = ServiceAppClient(client_id, client_secret)
-        try:
-            token = service_apps_client.get_service_app_token(subject_token=email).access_token
-        finally:
-            service_apps_client.session.close()
+        token = await get_service_token(client_id, client_secret, email)
     except Exception as error:
         log.error('Error getting service app token (%s)', type(error).__name__)
         return False
 
-    client = AsyncClient(token=token)
+    if vdhash is not None:
+        client = SharedDiskClient(token, vdhash)
+    else:
+        session = AsyncHTTPXSession(event_hooks={'response': [check_transient_response]})
+        client = AsyncClient(token=token, session=session, default_args={'n_retries': 0})
 
     async with client:
         progress.phase('проверка токена')
-        if await client.check_token():
+        if await with_retries(client.check_token, 'проверка токена'):
             log.info('Test service app token: Success')
         else:
             log.error('Test service app token: Failed')
             return False
 
         progress.phase('получение информации о Диске')
-        disk_info: DiskInfoObject = await client.get_disk_info()
+        disk_info: DiskInfoObject = await with_retries(client.get_disk_info, 'информация о Диске')
 
-        log.info(f'Starting files download for user: {email}')
+        log.info('Starting files download: %s', f'shared/{vdhash} (via {email})' if vdhash is not None else email)
         if disk_info.used_space:
             log.info(f'Used disk space: {round(disk_info.used_space / 1024 ** 2, 2)} MB')
 
@@ -321,7 +520,8 @@ async def download_user(email: str, output_dir: Path | None, progress: ProgressR
         log.info(f'Found files to download: {files_count} (after filtering)')
         progress.phase('подготовка путей')
 
-        root = (output_dir if output_dir is not None else Path(normalize_name(email))).absolute()
+        default_root = Path('shared', normalize_name(vdhash)) if vdhash is not None else Path(normalize_name(email))
+        root = (output_dir if output_dir is not None else default_root).absolute()
         if os.name == 'nt':
             root = Path(windows_long_path(str(root)))
         local_paths = LocalPaths(root)
@@ -397,9 +597,37 @@ async def download_users(users: list[str], status_interval: float = STATUS_INTER
     return successful == len(users)
 
 
+async def download_shared_disks(email: str, vdhashes: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
+    destinations = LocalPaths(Path.cwd() / 'shared')
+    for vdhash in sorted(vdhashes):
+        destinations.get('/' + vdhash)
+    successful = 0
+    for position, vdhash in enumerate(vdhashes, 1):
+        log.info('Shared disk [%s/%s]: %s (via %s)', position, len(vdhashes), vdhash, email)
+        try:
+            completed = await main(email, output_dir=destinations.get('/' + vdhash),
+                                   status_interval=status_interval, vdhash=vdhash)
+        except Exception as error:
+            log.error('Failed shared disk %s (%s)', vdhash, type(error).__name__)
+            completed = False
+        if completed:
+            successful += 1
+        else:
+            log.error('Download incomplete for shared disk: %s', vdhash)
+    log.info('Shared disks: %s; successful: %s; failed: %s',
+             len(vdhashes), successful, len(vdhashes) - successful)
+    return successful == len(vdhashes)
+
+
 async def download_file(client: AsyncClient, path: str, local_path: Path, file_position_of: str) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    await client.download(path, str(local_path))
+    with NamedTemporaryFile(dir=local_path.parent, prefix='.disk-download-', suffix='.part', delete=False) as file:
+        temporary_path = Path(file.name)
+    try:
+        await with_retries(lambda: client.download(path, str(temporary_path)), f'скачивание {path!r}')
+        temporary_path.replace(local_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     log.info('Downloaded file %s: %r -> %r', file_position_of, path, str(local_path))
 
 
@@ -430,7 +658,7 @@ async def list_directory(client: AsyncClient, path: str, progress: ProgressRepor
     if progress is not None:
         progress.current(path)
 
-    async for item in client.listdir(path):
+    for item in await directory_items(client, path):
         if item.type == 'dir' and item.path:
             if is_excluded(item.path):
                 log.debug(f'Skipping Messenger directory: {item.path}')
@@ -451,7 +679,7 @@ async def list_files(client: AsyncClient, progress: ProgressReporter | None = No
     for path in ['/', *(directory.path for directory in directories if directory.path)]:
         if progress is not None:
             progress.current(path)
-        async for item in client.listdir(path):
+        for item in await directory_items(client, path):
             if item.type == 'file':
                 files_list.append(item)
                 if progress is not None:
@@ -461,33 +689,141 @@ async def list_files(client: AsyncClient, progress: ProgressReporter | None = No
     return files_list
 
 
+def load_credentials() -> tuple[str, str]:
+    load_dotenv(Path.cwd() / '.env', interpolate=False)
+    return os.getenv('CLIENT_ID', ''), os.getenv('CLIENT_SECRET', '')
+
+
+def save_credentials(client_id: str, client_secret: str) -> None:
+    if not all(value and not any(char in value for char in '\r\n\x00') for value in (client_id, client_secret)):
+        raise ValueError('CLIENT_ID и CLIENT_SECRET должны быть непустыми строками без переноса строки')
+    destination = Path.cwd() / '.env'
+    with NamedTemporaryFile(dir=destination.parent, prefix='.env-', suffix='.tmp', delete=False) as file:
+        temporary_path = Path(file.name)
+    try:
+        if destination.exists():
+            temporary_path.write_bytes(destination.read_bytes())
+        set_key(temporary_path, 'CLIENT_ID', client_id)
+        set_key(temporary_path, 'CLIENT_SECRET', client_secret)
+        if os.name != 'nt':
+            temporary_path.chmod(0o600)
+        temporary_path.replace(destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    os.environ['CLIENT_ID'] = client_id
+    os.environ['CLIENT_SECRET'] = client_secret
+
+
+def configure_credentials() -> None:
+    current_id, current_secret = load_credentials()
+    client_id = questionary.text('CLIENT_ID:', default=current_id).unsafe_ask().strip()
+    prompt = 'CLIENT_SECRET (Enter — оставить текущий):' if current_secret else 'CLIENT_SECRET:'
+    client_secret = questionary.password(prompt).unsafe_ask() or current_secret
+    save_credentials(client_id, client_secret)
+    print(f'Настройки сохранены в {Path.cwd() / ".env"}')
+
+
+def terminal_menu(status_interval: float) -> int:
+    result = 0
+    choices = [
+        questionary.Choice('Личный Диск — один пользователь', 'user'),
+        questionary.Choice('Личные Диски — список email из CSV', 'users'),
+        questionary.Choice('Общий Диск — один VDHASH', 'shared'),
+        questionary.Choice('Общие Диски — список VDHASH из CSV', 'shared_csv'),
+        questionary.Choice('Настроить CLIENT_ID и CLIENT_SECRET', 'configure'),
+        questionary.Choice('Выход', 'exit'),
+    ]
+    while True:
+        client_id, client_secret = load_credentials()
+        configured = bool(client_id and client_secret)
+        print('\nЯндекс Диск · загрузчик')
+        print(f'Папка сохранения: {Path.cwd()}')
+        print('Сервисное приложение: настроено' if configured else 'Сервисное приложение: не настроено')
+        action = questionary.select('Выберите действие:', choices=choices,
+                                    instruction='(↑/↓ — выбор, Enter — подтвердить)').unsafe_ask()
+        if action == 'exit':
+            return result
+        try:
+            if action == 'configure':
+                configure_credentials()
+                continue
+            if action == 'users':
+                path = Path(questionary.path('CSV со списком email:').unsafe_ask()).expanduser()
+                users = read_users_csv(path)
+            elif action == 'user':
+                users = [validate_email(questionary.text('Email пользователя:').unsafe_ask())]
+            elif action in ('shared', 'shared_csv'):
+                email = validate_email(questionary.text('Email сотрудника с доступом к Общим Дискам:').unsafe_ask())
+                if action == 'shared':
+                    vdhashes = [validate_vdhash(questionary.text('VDHASH (метка после /vd/ в URL диска):').unsafe_ask())]
+                else:
+                    path = Path(questionary.path('CSV со списком VDHASH:').unsafe_ask()).expanduser()
+                    vdhashes = read_shared_disks_csv(path)
+            else:
+                raise ValueError('Неизвестный пункт меню')
+            if not configured:
+                configure_credentials()
+            if action in ('user', 'users'):
+                completed = asyncio.run(download_users(users, status_interval=status_interval))
+            else:
+                completed = asyncio.run(download_shared_disks(email, vdhashes, status_interval=status_interval))
+            if not completed:
+                result = 1
+        except UnicodeError:
+            print('Не удалось прочитать файл: требуется UTF-8.')
+        except csv.Error:
+            print('Некорректный формат CSV.')
+        except ValueError as error:
+            print(str(error))
+        except OSError as error:
+            print(f'Ошибка доступа к файлу ({type(error).__name__}).')
+
+
 def cli(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='Download user files from Yandex Disk')
-    parser.add_argument('--csv', type=Path, metavar='PATH', help='UTF-8 CSV with an email column or one email per row')
+    parser = argparse.ArgumentParser(description='Download personal or shared Yandex Disks')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--csv', type=Path, metavar='PATH', help='UTF-8 CSV with an email column or one email per row')
+    modes.add_argument('--vdhash', metavar='HASH', help='Shared disk ID; requires --email with reader access')
+    modes.add_argument('--vdhash-csv', type=Path, metavar='PATH', help='UTF-8 CSV with a VDHASH column; requires --email')
+    modes.add_argument('--configure', action='store_true', help='Configure CLIENT_ID and CLIENT_SECRET interactively')
+    parser.add_argument('--email', help='Personal disk owner or shared disk reader email')
     parser.add_argument('--status-interval', type=positive_interval, default=STATUS_INTERVAL, metavar='SECONDS',
                         help='Progress update interval in seconds (default: 10)')
     args = parser.parse_args(argv)
+    if args.email is not None and (args.csv is not None or args.configure):
+        parser.error('--email cannot be combined with --csv or --configure')
+    shared = args.vdhash is not None or args.vdhash_csv is not None
+    if shared and args.email is None:
+        parser.error('--email is required: use an employee with read access to the shared disks')
+    interactive = args.configure or not any((args.email is not None, args.csv is not None, shared))
+    if interactive and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        parser.error('Menu requires a terminal; use --email, --csv or --email with --vdhash / --vdhash-csv')
     try:
-        if args.csv is not None:
-            users = read_users_csv(args.csv)
-        else:
-            users = [validate_email(input('Enter user email: '))]
+        if args.configure:
+            configure_credentials()
+            return 0
+        if interactive:
+            return terminal_menu(args.status_interval)
+        if shared:
+            email = validate_email(args.email)
+            vdhashes = read_shared_disks_csv(args.vdhash_csv) if args.vdhash_csv is not None else [validate_vdhash(args.vdhash)]
+            return 0 if asyncio.run(download_shared_disks(email, vdhashes, status_interval=args.status_interval)) else 1
+        users = read_users_csv(args.csv) if args.csv is not None else [validate_email(args.email)]
+        return 0 if asyncio.run(download_users(users, status_interval=args.status_interval)) else 1
     except UnicodeError:
-        parser.error('CSV must be encoded as UTF-8')
+        parser.error('CSV and .env must be encoded as UTF-8')
     except OSError as error:
-        parser.error(f'Cannot read CSV ({type(error).__name__})')
+        parser.error(f'Cannot access file ({type(error).__name__})')
     except csv.Error:
         parser.error('Invalid CSV syntax')
     except ValueError as error:
         parser.error(str(error))
     except EOFError:
-        parser.error('No email provided; enter an email or use --csv PATH')
-    try:
-        return 0 if asyncio.run(download_users(users, status_interval=args.status_interval)) else 1
+        parser.error('Input closed')
     except KeyboardInterrupt:
-        log.info('Выгрузка прервана пользователем')
+        log.info('Работа прервана пользователем')
         return 130
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(cli())

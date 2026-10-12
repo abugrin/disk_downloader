@@ -62,10 +62,10 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         calls = {}
         auth_reported = False
 
-        def token(subject_token):
+        def token(client_id, client_secret, email):
             nonlocal auth_reported
             auth_reported = observer.events['auth'].wait(2)
-            return SimpleNamespace(access_token='test-token')
+            return 'test-token'
 
         async def wait_for_status(name):
             self.assertTrue(await asyncio.to_thread(observer.events[name].wait, 2), name)
@@ -94,11 +94,11 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'ServiceAppClient') as service,
+            patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
             self.assertLogs('Downloader') as logs,
         ):
-            service.return_value.get_service_app_token.side_effect = token
+            service.side_effect = token
             downloader.log.addHandler(observer)
             try:
                 completed = await downloader.main('test@example.invalid', status_interval=0.01)
@@ -125,11 +125,11 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'ServiceAppClient') as service,
+            patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
             self.assertLogs('Downloader'),
         ):
-            service.return_value.get_service_app_token.return_value.access_token = 'test-token'
+            service.return_value = 'test-token'
             downloader.log.addHandler(observer)
             task = asyncio.create_task(downloader.main('test@example.invalid', status_interval=0.01))
             try:
@@ -141,6 +141,42 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 downloader.log.removeHandler(observer)
+
+    async def test_status_continues_during_retry_wait(self):
+        observer = StatusObserver({'retry': (['этап: скачивание', 'в работе: 1'], 3)})
+        attempts = 0
+
+        async def listdir(path):
+            yield SimpleNamespace(type='file', path='disk:/file.txt')
+
+        async def download(remote, local):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TimeoutError('test timeout')
+            Path(local).write_text('complete')
+
+        async def wait_for_status(delay):
+            self.assertGreaterEqual(delay, 2)
+            self.assertTrue(await asyncio.to_thread(observer.events['retry'].wait, 2))
+
+        client = self.client(listdir, download)
+        with (
+            patch.object(downloader, 'load_dotenv'),
+            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            patch.object(downloader, 'get_service_token', return_value='test-token'),
+            patch.object(downloader, 'AsyncClient', return_value=client),
+            patch.object(downloader.asyncio, 'sleep', side_effect=wait_for_status),
+            self.assertLogs('Downloader') as logs,
+        ):
+            downloader.log.addHandler(observer)
+            try:
+                self.assertTrue(await downloader.main('test@example.invalid', status_interval=0.01))
+            finally:
+                downloader.log.removeHandler(observer)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(Path('test@example.invalid/file.txt').read_text(), 'complete')
+        self.assertIn('Повтор 1/5', '\n'.join(logs.output))
 
     async def test_exception_stops_status_thread(self):
         with self.assertLogs('Downloader'), self.assertRaisesRegex(RuntimeError, 'test'):
@@ -154,7 +190,7 @@ class StatusCliTests(unittest.TestCase):
             patch('builtins.input', return_value='test@example.invalid'),
             patch.object(downloader, 'download_users', new=AsyncMock(return_value=True)) as download,
         ):
-            self.assertEqual(downloader.cli(['--status-interval', '2.5']), 0)
+            self.assertEqual(downloader.cli(['--email', 'test@example.invalid', '--status-interval', '2.5']), 0)
         download.assert_awaited_once_with(['test@example.invalid'], status_interval=2.5)
 
     def test_invalid_intervals_fail_before_download(self):

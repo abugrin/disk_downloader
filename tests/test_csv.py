@@ -69,7 +69,7 @@ class CsvTests(unittest.TestCase):
         download.assert_not_called()
 
     def test_cli_handles_missing_file_and_invalid_encoding(self):
-        for content, expected in [(None, 'Cannot read CSV'), (b'email\n\xff\n', 'UTF-8')]:
+        for content, expected in [(None, 'Cannot access file'), (b'email\n\xff\n', 'UTF-8')]:
             with self.subTest(content=content):
                 if content is not None:
                     self.path.write_bytes(content)
@@ -90,7 +90,7 @@ class CsvTests(unittest.TestCase):
                 patch('builtins.input', return_value=' first@example.invalid '),
                 patch.object(downloader, 'download_users', new=AsyncMock(return_value=completed)) as download,
             ):
-                self.assertEqual(downloader.cli([]), expected)
+                self.assertEqual(downloader.cli(['--email', ' first@example.invalid ']), expected)
                 download.assert_awaited_once_with(['first@example.invalid'], status_interval=downloader.STATUS_INTERVAL)
 
 
@@ -141,27 +141,27 @@ class BatchTests(unittest.TestCase):
             users[3]: self.make_client(users[3], {'/': [('file', 'disk:/same.txt')]}),
         }
 
-        def token(subject_token):
-            if subject_token == users[0]:
+        def token(client_id, client_secret, email):
+            if email == users[0]:
                 raise RuntimeError('secret-must-not-be-logged')
-            return SimpleNamespace(access_token=subject_token)
+            return email
 
         with (
             patch('builtins.input', side_effect=AssertionError('CSV launch must not prompt')),
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'ServiceAppClient') as service,
-            patch.object(downloader, 'AsyncClient', side_effect=lambda token: clients[token]),
+            patch.object(downloader, 'get_service_token') as service,
+            patch.object(downloader, 'AsyncClient', side_effect=lambda token, **kwargs: clients[token]),
             self.assertLogs('Downloader') as logs,
         ):
-            service.return_value.get_service_app_token.side_effect = token
+            service.side_effect = token
             status = downloader.cli(['--csv', 'users.csv'])
         self.assertEqual(status, 1)
         self.assertEqual(
-            [call.kwargs['subject_token'] for call in service.return_value.get_service_app_token.call_args_list],
+            [call.args[-1] for call in service.await_args_list],
             users,
         )
-        self.assertEqual(service.return_value.session.close.call_count, len(users))
+        self.assertEqual(service.await_count, len(users))
         for email in users[2:]:
             self.assertEqual(Path(email, 'same.txt').read_text(), email)
         self.assertNotIn((users[3], 'disk:/old'), self.listed)
@@ -177,11 +177,11 @@ class BatchTests(unittest.TestCase):
         with (
             patch.object(downloader, 'load_dotenv'),
             patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
-            patch.object(downloader, 'ServiceAppClient') as service,
-            patch.object(downloader, 'AsyncClient', side_effect=lambda token: clients[token]),
+            patch.object(downloader, 'get_service_token') as service,
+            patch.object(downloader, 'AsyncClient', side_effect=lambda token, **kwargs: clients[token]),
             self.assertLogs('Downloader') as logs,
         ):
-            service.return_value.get_service_app_token.side_effect = lambda subject_token: SimpleNamespace(access_token=subject_token)
+            service.side_effect = lambda client_id, client_secret, email: email
             self.assertEqual(downloader.cli(['--csv', 'users.csv']), 0)
         files = list(Path.cwd().glob('*/same.txt'))
         self.assertEqual(len(files), 2)

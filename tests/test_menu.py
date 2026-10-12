@@ -1,0 +1,171 @@
+import asyncio
+import io
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+from dotenv import dotenv_values
+
+import downloader
+
+
+class MenuTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_cwd = Path.cwd()
+        os.chdir(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(os.chdir, self.old_cwd)
+        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.output = self.enterContext(patch('sys.stdout', new_callable=io.StringIO))
+
+    def answers(self, method, values):
+        return patch.object(downloader.questionary, method,
+                            return_value=SimpleNamespace(unsafe_ask=Mock(side_effect=values)))
+
+    def test_credentials_preserve_other_settings_and_literal_secret(self):
+        Path('.env').write_text("OTHER=value\nCLIENT_ID='old'\nCLIENT_SECRET='old'\n")
+        secret = "fake'\\${OTHER}secret"
+        downloader.save_credentials('new-id', secret)
+        saved = dotenv_values('.env', interpolate=False)
+        self.assertEqual(saved, {'OTHER': 'value', 'CLIENT_ID': 'new-id', 'CLIENT_SECRET': secret})
+        os.environ.pop('CLIENT_ID')
+        os.environ.pop('CLIENT_SECRET')
+        self.assertEqual(downloader.load_credentials(), ('new-id', secret))
+        self.assertFalse(list(Path.cwd().glob('.env-*.tmp')))
+        if os.name != 'nt':
+            self.assertEqual(stat.S_IMODE(Path('.env').stat().st_mode), 0o600)
+        self.assertNotIn(secret, self.output.getvalue())
+
+    def test_credentials_are_loaded_from_working_directory_and_env_has_priority(self):
+        Path('.env').write_text('CLIENT_ID=file-id\nCLIENT_SECRET=file-secret\n')
+        with patch.dict(os.environ, {'CLIENT_ID': 'env-id', 'CLIENT_SECRET': 'env-secret'}):
+            self.assertEqual(downloader.load_credentials(), ('env-id', 'env-secret'))
+        self.assertEqual(downloader.load_credentials(), ('file-id', 'file-secret'))
+
+    def test_configuration_keeps_secret_on_blank_password(self):
+        Path('.env').write_text('CLIENT_ID=old-id\nCLIENT_SECRET=fake-secret\n')
+        with self.answers('text', ['new-id']), self.answers('password', ['']):
+            downloader.configure_credentials()
+        self.assertEqual(downloader.load_credentials(), ('new-id', 'fake-secret'))
+        self.assertNotIn('fake-secret', self.output.getvalue())
+
+    def test_failed_save_is_atomic_and_does_not_change_process_credentials(self):
+        original = 'CLIENT_ID=old-id\nCLIENT_SECRET=old-secret\n'
+        Path('.env').write_text(original)
+        self.assertEqual(downloader.load_credentials(), ('old-id', 'old-secret'))
+        with patch.object(downloader, 'set_key', side_effect=[None, OSError('test')]), self.assertRaises(OSError):
+            downloader.save_credentials('new-id', 'new-secret')
+        self.assertEqual(Path('.env').read_text(), original)
+        self.assertEqual(downloader.load_credentials(), ('old-id', 'old-secret'))
+        self.assertFalse(list(Path.cwd().glob('.env-*.tmp')))
+
+    def test_invalid_credentials_are_rejected_without_writing(self):
+        for client_id, secret in [('', 'secret'), ('id', ''), ('id', 'line\nbreak'), ('id\x00', 'secret')]:
+            with self.subTest(client_id=client_id), self.assertRaises(ValueError):
+                downloader.save_credentials(client_id, secret)
+        self.assertFalse(Path('.env').exists())
+
+    def test_menu_all_modes_and_settings_dispatch(self):
+        Path('users.csv').write_text('email\nuser@example.invalid\n')
+        Path('disks.csv').write_text('VDHASH\nDiskA\nDiskB\n')
+        with (
+            patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
+            self.answers('select', ['user', 'users', 'shared', 'shared_csv', 'configure', 'exit']),
+            self.answers('text', ['user@example.invalid', 'reader@example.invalid', 'DiskA', 'reader@example.invalid']),
+            self.answers('path', ['users.csv', 'disks.csv']),
+            patch.object(downloader, 'configure_credentials') as configure,
+            patch.object(downloader, 'download_users', new=AsyncMock(return_value=True)) as users,
+            patch.object(downloader, 'download_shared_disks', new=AsyncMock(return_value=True)) as shared,
+        ):
+            self.assertEqual(downloader.terminal_menu(3), 0)
+            self.assertEqual(users.await_count, 2)
+            users.assert_awaited_with(['user@example.invalid'], status_interval=3)
+            self.assertEqual([call.args for call in shared.await_args_list],
+                             [('reader@example.invalid', ['DiskA']), ('reader@example.invalid', ['DiskA', 'DiskB'])])
+            configure.assert_called_once()
+
+    def test_first_download_prompts_for_missing_credentials(self):
+        with (
+            patch.object(downloader, 'load_credentials', return_value=('', '')),
+            self.answers('select', ['shared', 'exit']),
+            self.answers('text', ['reader@example.invalid', 'DiskA']),
+            patch.object(downloader, 'configure_credentials') as configure,
+            patch.object(downloader, 'download_shared_disks', new=AsyncMock(return_value=True)),
+        ):
+            self.assertEqual(downloader.terminal_menu(10), 0)
+            configure.assert_called_once()
+
+    def test_invalid_input_returns_to_menu_without_download(self):
+        with (
+            patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
+            self.answers('select', ['shared', 'exit']),
+            self.answers('text', ['reader@example.invalid', '../bad']),
+            patch.object(downloader, 'download_shared_disks') as download,
+        ):
+            self.assertEqual(downloader.terminal_menu(10), 0)
+            download.assert_not_called()
+            self.assertIn('Invalid VDHASH', self.output.getvalue())
+
+    def test_failed_download_returns_to_menu_and_preserves_failure_exit_status(self):
+        with (
+            patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
+            self.answers('select', ['user', 'exit']),
+            self.answers('text', ['user@example.invalid']),
+            patch.object(downloader, 'download_users', new=AsyncMock(return_value=False)),
+        ):
+            self.assertEqual(downloader.terminal_menu(10), 1)
+
+    def test_cli_uses_menu_and_ctrl_c_does_not_save_partial_settings(self):
+        with (patch('sys.stdin.isatty', return_value=True), patch('sys.stdout.isatty', return_value=True),
+              patch.object(downloader, 'terminal_menu', return_value=0) as menu):
+            self.assertEqual(downloader.cli(['--status-interval', '4']), 0)
+            menu.assert_called_once_with(4)
+        with (patch('sys.stdin.isatty', return_value=True), patch('sys.stdout.isatty', return_value=True),
+              self.answers('text', ['new-id']), self.answers('password', [KeyboardInterrupt()]),
+              self.assertLogs('Downloader')):
+            self.assertEqual(downloader.cli(['--configure']), 130)
+        self.assertFalse(Path('.env').exists())
+
+    def test_noninteractive_no_arguments_gives_actionable_error(self):
+        with (patch('sys.stdin.isatty', return_value=False), patch('sys.stderr', new_callable=io.StringIO) as stderr,
+              self.assertRaises(SystemExit) as error):
+            downloader.cli([])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn('--email', stderr.getvalue())
+
+    def test_repeated_menu_downloads_with_more_than_ten_files_use_new_semaphore(self):
+        active = maximum = 0
+        async def download(remote, local):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(active, maximum)
+            await asyncio.sleep(0.001)
+            Path(local).write_text('complete')
+            active -= 1
+        async def listdir(path):
+            for number in range(14):
+                yield SimpleNamespace(type='file', path=f'disk:/{number}.txt')
+        def client_factory(**kwargs):
+            client = AsyncMock()
+            client.__aenter__.return_value = client
+            client.check_token.return_value = True
+            client.get_disk_info.return_value = SimpleNamespace(used_space=0)
+            client.listdir = listdir
+            client.download.side_effect = download
+            return client
+        with (
+            patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
+            self.answers('select', ['user', 'user', 'exit']),
+            self.answers('text', ['user@example.invalid', 'user@example.invalid']),
+            patch.object(downloader, 'get_service_token', return_value='test-token'),
+            patch.object(downloader, 'AsyncClient', side_effect=client_factory),
+            self.assertLogs('Downloader'),
+        ):
+            self.assertEqual(downloader.terminal_menu(10), 0)
+        self.assertEqual(maximum, 10)
+        self.assertEqual(len(list(Path('user@example.invalid').iterdir())), 14)
