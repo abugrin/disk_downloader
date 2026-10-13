@@ -17,6 +17,7 @@ dist/
 /*@*/
 /downloads/
 /shared/
+/logs/
 *.log
 *.csv
 !users.example.csv

@@ -83,6 +83,48 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
     def delays(self):
         return [call.args[0] for call in self.sleep.await_args_list]
 
+    async def test_configured_retry_limits_apply_to_api_stream_and_oauth(self):
+        for limit in range(1, 6):
+            for endpoint in ['metadata', 'stream', 'oauth']:
+                with self.subTest(limit=limit, endpoint=endpoint), patch.dict(os.environ, {'MAX_RETRIES': str(limit)}):
+                    self.sleep.reset_mock()
+                    failures = 0
+                    def handler(request):
+                        nonlocal failures
+                        if endpoint == 'stream' and request.url.host != 'download.example.invalid':
+                            return download_link()
+                        failures += 1
+                        return httpx.Response(503)
+                    with self.assertRaises(Exception):
+                        if endpoint == 'oauth':
+                            auth = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+                            with patch.object(downloader.httpx, 'AsyncClient', return_value=auth):
+                                await downloader.get_service_token('test-id', 'test-secret', 'user@example.invalid')
+                        else:
+                            async with disk_client(handler) as client:
+                                if endpoint == 'metadata':
+                                    await downloader.with_retries(client.get_disk_info, 'test metadata')
+                                else:
+                                    await downloader.download_file(client, '/file', self.root / 'file', '[1/1]')
+                    if endpoint == 'oauth':
+                        self.assertTrue(auth.is_closed)
+                    self.assertEqual(failures, limit + 1)
+                    self.assertEqual(self.delays(), list(downloader.RETRY_DELAYS[:limit]))
+                    self.assertIn(f'Повтор {limit}/{limit}', '\n'.join(self.logs.output))
+
+    async def test_smaller_retry_limit_preserves_retry_after_and_jitter(self):
+        with patch.dict(os.environ, {'MAX_RETRIES': '1'}):
+            self.jitter.side_effect = lambda low, high: high
+            for retry_after, expected in [('0', 2.5), ('40', 40)]:
+                self.sleep.reset_mock()
+                response = httpx.Response(429, headers={'Retry-After': retry_after},
+                                          request=httpx.Request('GET', 'https://example.invalid'))
+                operation = AsyncMock(side_effect=httpx.HTTPStatusError('test', request=response.request, response=response))
+                with self.assertRaises(httpx.HTTPStatusError):
+                    await downloader.with_retries(operation, 'test')
+                self.assertEqual(operation.await_count, 2)
+                self.assertEqual(self.delays(), [expected])
+
     async def test_all_transient_statuses_have_six_attempts_without_nested_sdk_retries(self):
         for status in [408, 429, 500, 502, 503, 504]:
             for endpoint in ['metadata', 'download_link', 'stream']:

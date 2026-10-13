@@ -269,6 +269,9 @@ class ProcessResumeTests(unittest.TestCase):
                         self.assertTrue((cwd / 'closed-sessions').exists())
                         self.assertEqual(set((cwd / 'closed-streams').read_text().splitlines()),
                                          {'partial-a.txt', 'partial-b.txt'})
+                        log_file, = (cwd / 'logs').glob('*.log')
+                        self.assertIn('Работа прервана пользователем', log_file.read_text(encoding='utf-8'))
+                        self.assertIn('Завершение работы; код: 130', log_file.read_text(encoding='utf-8'))
                     else:
                         self.assertEqual(set(destination.glob('*.part')), set(partials))
                     command[-2] = 'restart'
@@ -291,5 +294,6 @@ class ProcessResumeTests(unittest.TestCase):
                     repeated = subprocess.run(command, cwd=cwd, capture_output=True, timeout=8)
                     self.assertEqual(repeated.returncode, 0, repeated.stdout.decode() + repeated.stderr.decode())
                     self.assertIn(b'skipped files: 4', repeated.stdout)
+                    self.assertEqual(len(list((cwd / 'logs').glob('*.log'))), 3)
                     self.assertEqual((cwd / 'requests.jsonl').read_text().splitlines(),
                                      [json.dumps(item) for item in requests])

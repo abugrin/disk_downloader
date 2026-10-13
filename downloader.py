@@ -21,7 +21,7 @@ import sys
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from random import uniform
@@ -108,19 +108,20 @@ def retry_details(error: Exception) -> tuple[bool, float, str]:
 
 
 async def with_retries[T](operation: Callable[[], Awaitable[T]], label: str) -> T:
+    max_retries = retry_limit()
     attempt = 0
     while True:
         try:
             return await operation()
         except Exception as error:
             retryable, retry_after, reason = retry_details(error)
-            if not retryable or attempt == len(RETRY_DELAYS):
+            if not retryable or attempt == max_retries:
                 raise
             base = RETRY_DELAYS[attempt]
             delay = max(base + uniform(0.0, base * 0.25), retry_after)
             attempt += 1
             log.warning('Повтор %s/%s через %.2f с: %s (%s)',
-                        attempt, len(RETRY_DELAYS), delay, label, reason)
+                        attempt, max_retries, delay, label, reason)
             await asyncio.sleep(delay)
 
 
@@ -881,24 +882,50 @@ def load_credentials() -> tuple[str, str]:
     return os.getenv('CLIENT_ID', ''), os.getenv('CLIENT_SECRET', '')
 
 
-def save_credentials(client_id: str, client_secret: str) -> None:
-    if not all(value and not any(char in value for char in '\r\n\x00') for value in (client_id, client_secret)):
-        raise ValueError('CLIENT_ID и CLIENT_SECRET должны быть непустыми строками без переноса строки')
+def retry_limit() -> int:
+    value = os.getenv('MAX_RETRIES', '5').strip()
+    if value not in ('1', '2', '3', '4', '5'):
+        raise ValueError('MAX_RETRIES должен быть целым числом от 1 до 5')
+    return int(value)
+
+
+def save_settings(values: dict[str, str]) -> None:
     destination = Path.cwd() / '.env'
     with NamedTemporaryFile(dir=destination.parent, prefix='.env-', suffix='.tmp', delete=False) as file:
         temporary_path = Path(file.name)
     try:
         if destination.exists():
             temporary_path.write_bytes(destination.read_bytes())
-        set_key(temporary_path, 'CLIENT_ID', client_id)
-        set_key(temporary_path, 'CLIENT_SECRET', client_secret)
+        for key, value in values.items():
+            set_key(temporary_path, key, value)
         if os.name != 'nt':
             temporary_path.chmod(0o600)
         temporary_path.replace(destination)
     finally:
         temporary_path.unlink(missing_ok=True)
-    os.environ['CLIENT_ID'] = client_id
-    os.environ['CLIENT_SECRET'] = client_secret
+    os.environ.update(values)
+
+
+def save_credentials(client_id: str, client_secret: str) -> None:
+    if not all(value and not any(char in value for char in '\r\n\x00') for value in (client_id, client_secret)):
+        raise ValueError('CLIENT_ID и CLIENT_SECRET должны быть непустыми строками без переноса строки')
+    save_settings({'CLIENT_ID': client_id, 'CLIENT_SECRET': client_secret})
+
+
+def configure_retries() -> None:
+    load_dotenv(Path.cwd() / '.env', interpolate=False)
+    try:
+        current = retry_limit()
+    except ValueError:
+        current = 5
+    selected = questionary.select(
+        'Количество повторов после первой попытки:', choices=['1', '2', '3', '4', '5'],
+        default=str(current), instruction='(↑/↓ — выбор, Enter — подтвердить)',
+    ).unsafe_ask()
+    if selected not in ('1', '2', '3', '4', '5'):
+        raise ValueError('Количество повторов должно быть от 1 до 5')
+    save_settings({'MAX_RETRIES': selected})
+    print(f'Количество повторов: {selected}. Настройка сохранена в {Path.cwd() / ".env"}')
 
 
 def configure_credentials() -> None:
@@ -918,6 +945,7 @@ def terminal_menu(status_interval: float) -> int:
         questionary.Choice('Общий Диск — один VDHASH', 'shared'),
         questionary.Choice('Общие Диски — список VDHASH из CSV', 'shared_csv'),
         questionary.Choice('Настроить CLIENT_ID и CLIENT_SECRET', 'configure'),
+        questionary.Choice('Настроить количество повторов (retry)', 'retries'),
         questionary.Choice('Выход', 'exit'),
     ]
     while True:
@@ -926,6 +954,10 @@ def terminal_menu(status_interval: float) -> int:
         print('\nЯндекс Диск · загрузчик')
         print(f'Папка сохранения: {Path.cwd()}')
         print('Сервисное приложение: настроено' if configured else 'Сервисное приложение: не настроено')
+        try:
+            print(f'Повторов после первой попытки: {retry_limit()}')
+        except ValueError as error:
+            print(str(error))
         action = questionary.select('Выберите действие:', choices=choices,
                                     instruction='(↑/↓ — выбор, Enter — подтвердить)').unsafe_ask()
         if action == 'exit':
@@ -934,6 +966,10 @@ def terminal_menu(status_interval: float) -> int:
             if action == 'configure':
                 configure_credentials()
                 continue
+            if action == 'retries':
+                configure_retries()
+                continue
+            retry_limit()
             if action == 'users':
                 path = Path(questionary.path('CSV со списком email:').unsafe_ask()).expanduser()
                 users = read_users_csv(path)
@@ -966,7 +1002,7 @@ def terminal_menu(status_interval: float) -> int:
             print(f'Ошибка доступа к файлу ({type(error).__name__}).')
 
 
-def cli(argv: list[str] | None = None) -> int:
+def run_cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Download personal or shared Yandex Disks')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--csv', type=Path, metavar='PATH', help='UTF-8 CSV with an email column or one email per row')
@@ -991,6 +1027,8 @@ def cli(argv: list[str] | None = None) -> int:
             return 0
         if interactive:
             return terminal_menu(args.status_interval)
+        load_dotenv(Path.cwd() / '.env', interpolate=False)
+        retry_limit()
         if shared:
             email = validate_email(args.email)
             vdhashes = read_shared_disks_csv(args.vdhash_csv) if args.vdhash_csv is not None else [validate_vdhash(args.vdhash)]
@@ -1010,6 +1048,50 @@ def cli(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.info('Работа прервана пользователем')
         return 130
+
+
+def create_run_log() -> logging.FileHandler:
+    directory = Path.cwd() / 'logs'
+    directory.mkdir(parents=True, exist_ok=True)
+    name = datetime.now().strftime('downloader_%Y-%m-%d_%H-%M-%S_%f')
+    suffix = 0
+    while True:
+        path = directory / f'{name}{"_" + str(suffix) if suffix else ""}.log'
+        try:
+            handler = logging.FileHandler(path, mode='x', encoding='utf-8', errors='backslashreplace')
+        except FileExistsError:
+            suffix += 1
+            continue
+        handler.setFormatter(log_handler.formatter)
+        return handler
+
+
+def cli(argv: list[str] | None = None) -> int:
+    try:
+        handler = create_run_log()
+    except OSError as error:
+        log.error('Не удалось создать файл журнала в папке logs (%s)', type(error).__name__)
+        return 1
+    log.addHandler(handler)
+    status = 1
+    try:
+        log.info('Лог запуска: %s', handler.baseFilename)
+        status = run_cli(argv)
+        return status
+    except SystemExit as error:
+        status = error.code if isinstance(error.code, int) else 1
+        raise
+    except KeyboardInterrupt:
+        status = 130
+        log.info('Работа прервана пользователем')
+        return status
+    except Exception as error:
+        log.error('Непредвиденная ошибка (%s)', type(error).__name__)
+        raise
+    finally:
+        log.info('Завершение работы; код: %s', status)
+        log.removeHandler(handler)
+        handler.close()
 
 
 if __name__ == '__main__':

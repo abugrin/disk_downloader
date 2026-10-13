@@ -71,6 +71,90 @@ class MenuTests(unittest.TestCase):
                 downloader.save_credentials(client_id, secret)
         self.assertFalse(Path('.env').exists())
 
+    def test_retry_setting_persists_and_preserves_credentials(self):
+        Path('.env').write_text('CLIENT_ID=test-id\nCLIENT_SECRET=fake-secret\nMAX_RETRIES=2\nOTHER=value\n')
+        with self.answers('select', ['3']) as select:
+            downloader.configure_retries()
+        self.assertEqual(select.call_args.kwargs['choices'], ['1', '2', '3', '4', '5'])
+        self.assertEqual(select.call_args.kwargs['default'], '2')
+        self.assertEqual(downloader.retry_limit(), 3)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(downloader.load_credentials(), ('test-id', 'fake-secret'))
+            self.assertEqual(downloader.retry_limit(), 3)
+        downloader.save_credentials('new-id', 'new-fake-secret')
+        self.assertEqual(dotenv_values('.env', interpolate=False), {
+            'CLIENT_ID': 'new-id', 'CLIENT_SECRET': 'new-fake-secret', 'MAX_RETRIES': '3', 'OTHER': 'value',
+        })
+        self.assertNotIn('fake-secret', self.output.getvalue())
+
+    def test_retry_setting_applies_to_download_from_same_menu(self):
+        operation = AsyncMock(side_effect=TimeoutError)
+        async def download(*args, **kwargs):
+            try:
+                await downloader.with_retries(operation, 'test request')
+            except TimeoutError:
+                return False
+        with (
+            patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
+            self.answers('select', ['retries', '1', 'user', 'exit']),
+            self.answers('text', ['user@example.invalid']),
+            patch.object(downloader, 'download_users', side_effect=download),
+            patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep,
+            patch.object(downloader, 'uniform', return_value=0),
+            self.assertLogs('Downloader') as logs,
+        ):
+            self.assertEqual(downloader.terminal_menu(10), 1)
+        self.assertEqual(operation.await_count, 2)
+        sleep.assert_awaited_once_with(2)
+        self.assertIn('Повтор 1/1', '\n'.join(logs.output))
+        self.assertIn('Повторов после первой попытки: 1', self.output.getvalue())
+
+    def test_invalid_retry_setting_can_be_repaired_from_menu(self):
+        Path('.env').write_text('MAX_RETRIES=0\n')
+        with (self.answers('select', ['user', 'retries', '4', 'exit']),
+              patch.object(downloader, 'download_users') as download):
+            self.assertEqual(downloader.terminal_menu(10), 0)
+        download.assert_not_called()
+        self.assertEqual(downloader.retry_limit(), 4)
+        self.assertIn('MAX_RETRIES должен быть целым числом от 1 до 5', self.output.getvalue())
+
+    def test_invalid_retry_setting_stops_cli_before_network_calls(self):
+        for value in ['0', '6', '-1', '1.5', 'invalid', '']:
+            with self.subTest(value=value), patch.dict(os.environ, {'MAX_RETRIES': value}):
+                with (patch.object(downloader, 'download_users') as download,
+                      patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit) as error):
+                    downloader.cli(['--email', 'user@example.invalid'])
+                self.assertEqual(error.exception.code, 2)
+                download.assert_not_called()
+
+    def test_retry_cancel_and_failed_save_preserve_previous_setting(self):
+        original = 'MAX_RETRIES=2\nCLIENT_SECRET=fake-secret\n'
+        Path('.env').write_text(original)
+        for error in [KeyboardInterrupt, OSError]:
+            with self.subTest(error=error):
+                selection = KeyboardInterrupt() if error is KeyboardInterrupt else '1'
+                with (self.answers('select', [selection]),
+                      patch.object(downloader, 'set_key', side_effect=OSError('test')),
+                      self.assertRaises(error)):
+                    downloader.configure_retries()
+                self.assertEqual(Path('.env').read_text(), original)
+                self.assertEqual(downloader.retry_limit(), 2)
+                self.assertFalse(list(Path.cwd().glob('.env-*.tmp')))
+
+    def test_retry_selection_with_real_keyboard_input(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        original_select = downloader.questionary.select
+        with create_pipe_input() as keyboard:
+            keyboard.send_text('\x1b[A' * 4 + '\r')
+            def select(*args, **kwargs):
+                return original_select(*args, input=keyboard, output=DummyOutput(), **kwargs)
+            with patch.object(downloader.questionary, 'select', side_effect=select):
+                downloader.configure_retries()
+        self.assertEqual(downloader.retry_limit(), 1)
+        self.assertEqual(dotenv_values('.env')['MAX_RETRIES'], '1')
+
     def test_menu_all_modes_and_settings_dispatch(self):
         Path('users.csv').write_text('email\nuser@example.invalid\n')
         Path('disks.csv').write_text('VDHASH\nDiskA\nDiskB\n')
