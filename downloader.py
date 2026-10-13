@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import stat
 import sys
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -69,6 +70,10 @@ MAX_NAME_BYTES = 240
 EMAIL_PATTERN = re.compile(r'[^@\s<>"/\\,;\x00-\x1f\x7f]+@[^@\s<>"/\\,;\x00-\x1f\x7f]+')
 
 
+class DownloadIntegrityError(Exception):
+    pass
+
+
 def retry_after_seconds(value: str | None) -> float:
     if value is None:
         return 0.0
@@ -97,7 +102,7 @@ def retry_details(error: Exception) -> tuple[bool, float, str]:
         if status is not None:
             headers = getattr(response, 'headers', {})
             return status in RETRY_STATUSES, retry_after_seconds(headers.get('Retry-After')), f'HTTP {status}'
-        network_error |= isinstance(current, NETWORK_ERRORS)
+        network_error |= isinstance(current, (*NETWORK_ERRORS, DownloadIntegrityError))
         current = current.__cause__
     return network_error, 0.0, type(error).__name__
 
@@ -378,13 +383,18 @@ class ProgressReporter:
         with self._lock:
             self._active[path] = monotonic()
 
-    def finish_file(self, path: str, success: bool | None) -> None:
+    def finish_file(self, path: str, success: bool | None, *, skipped: bool = False) -> None:
         with self._lock:
             self._active.pop(path, None)
             if success is not None:
-                key = 'downloaded' if success else 'failed_files'
+                key = ('skipped' if skipped else 'downloaded') if success else 'failed_files'
                 self._counts[key] = self._counts.get(key, 0) + 1
                 self._last_result = monotonic()
+
+    @property
+    def skipped_files(self) -> int:
+        with self._lock:
+            return self._counts.get('skipped', 0)
 
     def report(self) -> None:
         with self._lock:
@@ -404,12 +414,14 @@ class ProgressReporter:
             details = f" | создано или уже существует: {counts.get('prepared', 0)}, ошибок: {counts.get('failed_directories', 0)}"
         elif phase == 'скачивание':
             downloaded, failed = counts.get('downloaded', 0), counts.get('failed_files', 0)
-            completed = downloaded + failed
+            skipped = counts.get('skipped', 0)
+            completed = downloaded + skipped + failed
             percent = completed / total * 100 if total else 100
             queued = max(0, total - completed - len(active))
             details = (
                 f' | файлов завершено: {completed}/{total} ({percent:.1f}%)'
                 f' | скачано: {downloaded}, ошибок: {failed}'
+                f', уже скачано: {skipped}'
                 f' | в работе: {len(active)}, в очереди: {queued}'
             )
         if active:
@@ -673,18 +685,26 @@ async def download_user(
                         local_path=local_paths.get(path),
                         file_position_of=file_position_str,
                         progress=progress,
+                        resource=file,
                     )
                 ))
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         progress.report()
-        downloaded = sum(results)
+        successful = sum(results)
+        skipped = progress.skipped_files
         end_time = time()
         log.info(
-            'Downloaded %s files; failed files: %s; failed directories: %s; time: %s minutes',
-            downloaded, len(results) - downloaded, failed_directories,
+            'Downloaded %s files; failed files: %s; failed directories: %s; skipped files: %s; time: %s minutes',
+            successful - skipped, len(results) - successful, failed_directories, skipped,
             round((end_time - start_time) / 60, 2),
         )
-        return downloaded == len(results) and failed_directories == 0
+        return successful == len(results) and failed_directories == 0
 
 
 async def download_users(users: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
@@ -729,12 +749,59 @@ async def download_shared_disks(email: str, vdhashes: list[str], status_interval
     return successful == len(vdhashes)
 
 
-async def download_file(client: AsyncClient, path: str, local_path: Path, file_position_of: str) -> None:
+def matches_resource(local_path: Path, resource: ResourceObject | None, stop: Event) -> bool | None:
+    try:
+        info = local_path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError('Destination is not a regular file')
+    size = getattr(resource, 'size', None)
+    known_size = type(size) is int and size >= 0
+    if known_size and info.st_size != size:
+        return False
+    for algorithm, length in [('sha256', 64), ('md5', 32)]:
+        expected = getattr(resource, algorithm, None)
+        if not expected:
+            continue
+        if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-fA-F]{' + str(length) + '}', expected):
+            raise ValueError('Invalid resource checksum')
+        digest = hashlib.new(algorithm, usedforsecurity=False)
+        with local_path.open('rb') as file:
+            while not stop.is_set():
+                chunk = file.read(1024 * 1024)
+                if not chunk:
+                    return digest.hexdigest() == expected.lower()
+                digest.update(chunk)
+        return False
+    return True if known_size else None
+
+
+async def check_local_file(local_path: Path, resource: ResourceObject | None) -> bool | None:
+    stop = Event()
+    task = asyncio.create_task(asyncio.to_thread(matches_resource, local_path, resource, stop))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+async def download_file(
+    client: AsyncClient, path: str, local_path: Path, file_position_of: str,
+    resource: ResourceObject | None = None,
+) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(dir=local_path.parent, prefix='.disk-download-', suffix='.part', delete=False) as file:
         temporary_path = Path(file.name)
     try:
-        await with_retries(lambda: client.download(path, str(temporary_path)), f'скачивание {path!r}')
+        async def attempt() -> None:
+            await client.download(path, str(temporary_path))
+            if await check_local_file(temporary_path, resource) is False:
+                raise DownloadIntegrityError('Downloaded file does not match resource metadata')
+
+        await with_retries(attempt, f'скачивание {path!r}')
         temporary_path.replace(local_path)
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -744,13 +811,23 @@ async def download_file(client: AsyncClient, path: str, local_path: Path, file_p
 async def safe_download(
     client: AsyncClient, path: str, local_path: Path, file_position_of: str,
     progress: ProgressReporter | None = None,
+    resource: ResourceObject | None = None,
 ) -> bool:
     async with sem:
         if progress is not None:
             progress.start_file(path)
         success = None
+        skipped = False
         try:
-            await download_file(client, path, local_path, file_position_of)
+            complete = await check_local_file(local_path, resource)
+            if complete is None:
+                log.error('Cannot verify existing file without size or checksum: %r', str(local_path))
+                raise ValueError('Missing resource metadata')
+            if complete:
+                skipped = True
+                log.info('Already downloaded %s: %r -> %r', file_position_of, path, str(local_path))
+            else:
+                await download_file(client, path, local_path, file_position_of, resource)
         except Exception as error:
             log.error('Failed file %s: %r -> %r (%s)',
                       file_position_of, path, str(local_path), type(error).__name__)
@@ -759,7 +836,7 @@ async def safe_download(
             success = True
         finally:
             if progress is not None:
-                progress.finish_file(path, success)
+                progress.finish_file(path, success, skipped=skipped)
         return success is True
 
 

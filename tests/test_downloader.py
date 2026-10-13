@@ -92,8 +92,8 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
     async def run_main(self, tree, download):
         async def listdir(path):
             self.listed_paths.append(path)
-            for kind, item_path in tree.get(path, []):
-                yield SimpleNamespace(type=kind, path=item_path)
+            for kind, item_path, *metadata in tree.get(path, []):
+                yield SimpleNamespace(type=kind, path=item_path, size=metadata[0] if metadata else None)
 
         client = AsyncMock()
         client.__aenter__.return_value = client
@@ -198,7 +198,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(Path(self.email, 'Файлы Мессенджера архив/keep.txt').is_file())
 
     async def test_filename_mapping_is_independent_of_api_order(self):
-        files = [('file', 'disk:/A?.txt'), ('file', 'disk:/A*.txt'), ('file', 'disk:/a_.TXT')]
+        files = [('file', 'disk:/A?.txt', 7), ('file', 'disk:/A*.txt', 7), ('file', 'disk:/a_.TXT', 7)]
         mappings = []
         for ordered in [files, list(reversed(files))]:
             async def download(remote, local):

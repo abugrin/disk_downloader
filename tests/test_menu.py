@@ -150,7 +150,7 @@ class MenuTests(unittest.TestCase):
             active -= 1
         async def listdir(path):
             for number in range(14):
-                yield SimpleNamespace(type='file', path=f'disk:/{number}.txt')
+                yield SimpleNamespace(type='file', path=f'disk:/{number}.txt', size=8)
         def client_factory(**kwargs):
             client = AsyncMock()
             client.__aenter__.return_value = client
@@ -162,7 +162,7 @@ class MenuTests(unittest.TestCase):
         with (
             patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
             self.answers('select', ['user', 'user', 'exit']),
-            self.answers('text', ['user@example.invalid', 'user@example.invalid']),
+            self.answers('text', ['user@example.invalid', 'another@example.invalid']),
             patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'AsyncClient', side_effect=client_factory),
             self.assertLogs('Downloader'),
@@ -170,3 +170,4 @@ class MenuTests(unittest.TestCase):
             self.assertEqual(downloader.terminal_menu(10), 0)
         self.assertEqual(maximum, 10)
         self.assertEqual(len(list(Path('user@example.invalid').iterdir())), 14)
+        self.assertEqual(len(list(Path('another@example.invalid').iterdir())), 14)

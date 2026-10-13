@@ -94,9 +94,10 @@ class SharedDownloadTests(unittest.IsolatedAsyncioTestCase):
             return session
         return patch.object(downloader, 'AsyncHTTPXSession', side_effect=factory)
 
-    def page(self, items, total=None):
+    def page(self, items, total=None, size=8):
         return httpx.Response(200, json={'type': 'dir', '_embedded': {
-            'items': [{'type': kind, 'path': path} for kind, path in items],
+            'items': [{'type': kind, 'path': path, **({'size': size} if kind == 'file' else {})}
+                      for kind, path in items],
             'total': len(items) if total is None else total,
         }})
 
@@ -152,7 +153,7 @@ class SharedDownloadTests(unittest.IsolatedAsyncioTestCase):
             listing_offsets.append(offset)
             if listing_offsets == [0, 1]:
                 return httpx.Response(503)
-            return self.page([('file', f'vd:RetryDisk:disk:/{offset}.txt')], total=2)
+            return self.page([('file', f'vd:RetryDisk:disk:/{offset}.txt')], total=2, size=5)
 
         with self.transport(handler):
             self.assertTrue(await downloader.download_shared_disks('reader@example.invalid', ['RetryDisk']))

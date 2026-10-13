@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from yadisk import AsyncClient
+from yadisk.objects import ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 import downloader
@@ -219,7 +220,8 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                     return httpx.Response(200, stream=stream) if calls == 1 else httpx.Response(200, content=b'complete')
 
                 async with disk_client(handler) as client:
-                    self.assertTrue(await downloader.safe_download(client, '/file', destination, '[1/1]'))
+                    self.assertTrue(await downloader.safe_download(client, '/file', destination, '[1/1]',
+                                                                   resource=ResourceObject({'size': 8})))
                 self.assertEqual(destination.read_bytes(), b'complete')
                 self.assertEqual(calls, 2)
                 self.assertEqual(self.delays(), [2])
@@ -240,12 +242,13 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
 
         progress = Mock()
         async with disk_client(handler) as client:
-            self.assertFalse(await downloader.safe_download(client, '/file', destination, '[1/1]', progress))
+            self.assertFalse(await downloader.safe_download(client, '/file', destination, '[1/1]', progress,
+                                                            resource=ResourceObject({'size': 8})))
         self.assertEqual(len(streams), 6)
         self.assertTrue(all(stream.closed for stream in streams))
         self.assertEqual(destination.read_bytes(), b'existing copy')
         self.assertEqual(list(self.root.iterdir()), [destination])
-        progress.finish_file.assert_called_once_with('/file', False)
+        progress.finish_file.assert_called_once_with('/file', False, skipped=False)
 
     async def test_cancel_during_retry_wait_removes_partial_file(self):
         stream = BrokenStream(httpx.ReadError('broken stream'))
@@ -260,7 +263,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                 await downloader.safe_download(client, '/file', self.root / 'file', '[1/1]', progress)
         self.assertTrue(stream.closed)
         self.assertFalse(list(self.root.iterdir()))
-        progress.finish_file.assert_called_once_with('/file', None)
+        progress.finish_file.assert_called_once_with('/file', None, skipped=False)
         self.assertEqual(downloader.sem._value, downloader.MAX_STREAMS)
 
     async def test_failure_on_second_listing_page_does_not_duplicate_files_or_counters(self):
