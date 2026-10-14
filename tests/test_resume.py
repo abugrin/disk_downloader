@@ -34,6 +34,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.file = self.root / 'file.txt'
         downloader.sem = asyncio.Semaphore(downloader.MAX_STREAMS)
+        self.enterContext(patch.dict(os.environ, {'MAX_RETRIES': '3'}))
         self.logs = self.enterContext(self.assertLogs('Downloader'))
 
     async def test_complete_files_are_skipped_without_network_or_modification(self):
@@ -116,8 +117,8 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             async with disk_client(handler) as client:
                 self.assertFalse(await downloader.safe_download(client, '/file', self.file, '[1/1]',
                                                                 resource=metadata(b'complete')))
-        self.assertEqual(calls, 6)
-        self.assertEqual([call.args[0] for call in sleep.await_args_list], [2, 4, 8, 16, 32])
+        self.assertEqual(calls, 4)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [2, 4, 8])
         self.assertEqual(self.file.read_bytes(), b'old')
         self.assertEqual(list(self.root.iterdir()), [self.file])
 
@@ -128,7 +129,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
                                                         resource=ResourceObject({})))
         client.download.assert_not_awaited()
         self.assertEqual(self.file.read_bytes(), b'keep')
-        self.assertIn('Cannot verify existing file', '\n'.join(self.logs.output))
+        self.assertIn('Нельзя проверить существующий файл', '\n'.join(self.logs.output))
 
     async def test_nonregular_destination_is_not_replaced(self):
         self.file.mkdir()
@@ -173,6 +174,7 @@ from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 import downloader
 
 mode, shared = sys.argv[2], sys.argv[3] == 'shared'
+batch = len(sys.argv) > 4 and sys.argv[4] == 'csv'
 downloader.MAX_STREAMS = 2
 bodies = {'done.txt': b'complete', 'partial-a.txt': b'a' * 32768 + b'end',
           'partial-b.txt': b'b' * 32768 + b'end', 'queued.txt': b'queued'}
@@ -224,7 +226,9 @@ with (patch.object(downloader, 'load_credentials', return_value=('fake', 'fake')
       patch.object(downloader, 'AsyncHTTPXSession', side_effect=session_factory)):
     args = ['--email', 'reader@example.invalid']
     if shared:
-        args += ['--vdhash', 'ExampleHash']
+        args += ['--vdhash-csv', 'disks.csv'] if batch else ['--vdhash', 'ExampleHash']
+    elif batch:
+        args = ['--csv', 'users.csv']
     result = downloader.cli(args)
 assert all(session.httpx_session.is_closed for session in sessions)
 Path('closed-sessions').touch()
@@ -286,14 +290,14 @@ class ProcessResumeTests(unittest.TestCase):
                     requests = [json.loads(line) for line in (cwd / 'requests.jsonl').read_text().splitlines()]
                     self.assertEqual({item['name'] for item in requests if item['run'] == 'restart'},
                                      {'partial-a.txt', 'partial-b.txt', 'queued.txt'})
-                    self.assertIn(b'skipped files: 1', resumed.stdout)
+                    self.assertIn('уже скачано: 1'.encode('utf-8'), resumed.stdout)
                     self.assertTrue((cwd / 'closed-sessions').exists())
                     self.assertNotIn(b'Task was destroyed', resumed.stderr)
                     self.assertNotIn(b'was never awaited', resumed.stderr)
                     command[-2] = 'again'
                     repeated = subprocess.run(command, cwd=cwd, capture_output=True, timeout=8)
                     self.assertEqual(repeated.returncode, 0, repeated.stdout.decode() + repeated.stderr.decode())
-                    self.assertIn(b'skipped files: 4', repeated.stdout)
+                    self.assertIn('уже скачано: 4'.encode('utf-8'), repeated.stdout)
                     self.assertEqual(len(list((cwd / 'logs').glob('*.log'))), 3)
                     self.assertEqual((cwd / 'requests.jsonl').read_text().splitlines(),
                                      [json.dumps(item) for item in requests])

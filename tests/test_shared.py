@@ -155,9 +155,9 @@ class SharedDownloadTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(503)
             return self.page([('file', f'vd:RetryDisk:disk:/{offset}.txt')], total=2, size=5)
 
-        with self.transport(handler):
+        with self.transport(handler), patch.dict(os.environ, {'MAX_RETRIES': '3'}):
             self.assertTrue(await downloader.download_shared_disks('reader@example.invalid', ['RetryDisk']))
-        self.assertEqual(listing_offsets, [0, 1, 0, 1, 0, 1])
+        self.assertEqual(listing_offsets, [0, 1, 0, 1])
         self.assertEqual(links, {'0.txt': 3, '1.txt': 1})
         self.assertEqual(sorted(call.args[0] for call in self.sleep.await_args_list), [2, 4, 10])
         self.assertTrue(stream.closed)
@@ -190,16 +190,16 @@ class SharedDownloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_hashes_differing_only_by_case_get_separate_local_folders(self):
         with self.transport(lambda request: self.page([])):
             self.assertTrue(await downloader.download_shared_disks('reader@example.invalid', ['Disk', 'disk']))
-        folders = [path.name.casefold() for path in Path('shared').iterdir()]
+        folders = [path.name.casefold() for path in Path('shared').iterdir() if path.name != '.disk-downloader']
         self.assertEqual(len(set(folders)), 2)
 
-    async def test_shared_download_exhausts_exactly_five_retries(self):
+    async def test_shared_download_caps_setting_at_three_retries(self):
         count = 0
         def handler(request):
             nonlocal count
             count += 1
             return httpx.Response(504)
-        with self.transport(handler):
+        with self.transport(handler), patch.dict(os.environ, {'MAX_RETRIES': '5'}):
             self.assertFalse(await downloader.download_shared_disks('reader@example.invalid', ['Fail']))
-        self.assertEqual(count, 6)
-        self.assertEqual([call.args[0] for call in self.sleep.await_args_list], [2, 4, 8, 16, 32])
+        self.assertEqual(count, 4)
+        self.assertEqual([call.args[0] for call in self.sleep.await_args_list], [2, 4, 8])

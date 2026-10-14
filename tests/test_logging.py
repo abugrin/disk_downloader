@@ -43,6 +43,7 @@ class FileLoggingTests(unittest.TestCase):
         self.assertRegex(files[0].name, r'^downloader_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}\.log$')
         content = files[0].read_text(encoding='utf-8')
         self.assertEqual(content, self.console.getvalue())
+        self.assertIn(f'Версия {downloader.VERSION} | Лог запуска:', content.splitlines()[0])
         self.assertIn('Скачан файл: отчёт.txt', content)
         self.assertIn('Повтор запроса', content)
         self.assertIn(str(files[0].resolve()), content)
@@ -72,6 +73,7 @@ class FileLoggingTests(unittest.TestCase):
         for file in self.logs():
             content = file.read_text(encoding='utf-8')
             self.assertEqual(content.count('Лог запуска:'), 1)
+            self.assertEqual(content.count(f'Версия {downloader.VERSION}'), 1)
             self.assertEqual(content.count('Завершение работы;'), 1)
 
     def test_multiple_downloads_from_menu_use_one_log(self):
@@ -117,6 +119,7 @@ class FileLoggingTests(unittest.TestCase):
               patch.object(downloader, 'run_cli') as run):
             self.assertEqual(downloader.cli(['--email', 'reader@example.invalid']), 1)
         run.assert_not_called()
+        self.assertIn(f'Версия {downloader.VERSION}', self.console.getvalue())
         self.assertIn('Не удалось создать файл журнала', self.console.getvalue())
         self.assertNotIn('fake-secret', self.console.getvalue())
 
@@ -127,5 +130,6 @@ class FileLoggingTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertEqual(len(self.logs()), count)
             self.assertIn(b'usage:', result.stdout)
+            self.assertIn(f'Версия {downloader.VERSION}'.encode('utf-8'), result.stdout)
         for file in self.logs():
             self.assertIn('Завершение работы; код: 0', file.read_text(encoding='utf-8'))

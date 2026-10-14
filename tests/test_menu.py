@@ -75,7 +75,7 @@ class MenuTests(unittest.TestCase):
         Path('.env').write_text('CLIENT_ID=test-id\nCLIENT_SECRET=fake-secret\nMAX_RETRIES=2\nOTHER=value\n')
         with self.answers('select', ['3']) as select:
             downloader.configure_retries()
-        self.assertEqual(select.call_args.kwargs['choices'], ['1', '2', '3', '4', '5'])
+        self.assertEqual(select.call_args.kwargs['choices'], ['0', '1', '2', '3'])
         self.assertEqual(select.call_args.kwargs['default'], '2')
         self.assertEqual(downloader.retry_limit(), 3)
         with patch.dict(os.environ, {}, clear=True):
@@ -110,22 +110,74 @@ class MenuTests(unittest.TestCase):
         self.assertIn('Повторов после первой попытки: 1', self.output.getvalue())
 
     def test_invalid_retry_setting_can_be_repaired_from_menu(self):
-        Path('.env').write_text('MAX_RETRIES=0\n')
-        with (self.answers('select', ['user', 'retries', '4', 'exit']),
+        Path('.env').write_text('MAX_RETRIES=invalid\n')
+        with (self.answers('select', ['user', 'retries', '3', 'exit']),
               patch.object(downloader, 'download_users') as download):
             self.assertEqual(downloader.terminal_menu(10), 0)
         download.assert_not_called()
-        self.assertEqual(downloader.retry_limit(), 4)
-        self.assertIn('MAX_RETRIES должен быть целым числом от 1 до 5', self.output.getvalue())
+        self.assertEqual(downloader.retry_limit(), 3)
+        self.assertIn('MAX_RETRIES должен быть', self.output.getvalue())
+
+    def test_retry_menu_defaults_to_zero_for_invalid_setting(self):
+        Path('.env').write_text('MAX_RETRIES=invalid\n')
+        with self.answers('select', ['0']) as select:
+            downloader.configure_retries()
+        self.assertEqual(select.call_args.kwargs['default'], '0')
+        with patch.dict(os.environ, {}, clear=True):
+            downloader.load_credentials()
+            self.assertEqual(downloader.retry_limit(), 0)
+
+    def test_retry_menu_caps_existing_setting_without_saving_on_cancel(self):
+        original = 'MAX_RETRIES=100\nOTHER=value\n'
+        Path('.env').write_text(original)
+        with self.answers('select', [KeyboardInterrupt()]) as select, self.assertRaises(KeyboardInterrupt):
+            downloader.configure_retries()
+        self.assertEqual(select.call_args.kwargs['default'], '3')
+        self.assertEqual(select.call_args.kwargs['choices'], ['0', '1', '2', '3'])
+        self.assertEqual(Path('.env').read_text(), original)
+        self.assertEqual(downloader.retry_limit(), 3)
+
+    def test_retry_menu_rejects_values_above_three_without_saving(self):
+        original = 'MAX_RETRIES=2\nOTHER=value\n'
+        Path('.env').write_text(original)
+        for value in ('4', '5'):
+            with self.subTest(value=value), self.answers('select', [value]), self.assertRaises(ValueError):
+                downloader.configure_retries()
+            self.assertEqual(Path('.env').read_text(), original)
+            self.assertEqual(downloader.retry_limit(), 2)
 
     def test_invalid_retry_setting_stops_cli_before_network_calls(self):
-        for value in ['0', '6', '-1', '1.5', 'invalid', '']:
+        for value in ['-1', '1.5', 'invalid', '']:
             with self.subTest(value=value), patch.dict(os.environ, {'MAX_RETRIES': value}):
                 with (patch.object(downloader, 'download_users') as download,
                       patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit) as error):
                     downloader.cli(['--email', 'user@example.invalid'])
                 self.assertEqual(error.exception.code, 2)
                 download.assert_not_called()
+
+    def test_cli_defaults_to_no_retries_and_caps_env_without_rewriting_it(self):
+        for value, retries in [(None, 0), ('4', 3), ('5', 3), ('100', 3)]:
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=True):
+                original = 'OTHER=value\n' if value is None else f'OTHER=value\nMAX_RETRIES={value}\n'
+                Path('.env').write_text(original)
+                operation = AsyncMock(side_effect=TimeoutError)
+
+                async def download(*args, **kwargs):
+                    try:
+                        await downloader.with_retries(operation, 'test request')
+                    except TimeoutError:
+                        return False
+
+                with (
+                    patch.object(downloader, 'download_users', side_effect=download),
+                    patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep,
+                    patch.object(downloader, 'uniform', return_value=0),
+                    self.assertLogs('Downloader'),
+                ):
+                    self.assertEqual(downloader.cli(['--email', 'user@example.invalid']), 1)
+                self.assertEqual(operation.await_count, retries + 1)
+                self.assertEqual([call.args[0] for call in sleep.await_args_list], [2, 4, 8][:retries])
+                self.assertEqual(Path('.env').read_text(), original)
 
     def test_retry_cancel_and_failed_save_preserve_previous_setting(self):
         original = 'MAX_RETRIES=2\nCLIENT_SECRET=fake-secret\n'
@@ -147,13 +199,13 @@ class MenuTests(unittest.TestCase):
 
         original_select = downloader.questionary.select
         with create_pipe_input() as keyboard:
-            keyboard.send_text('\x1b[A' * 4 + '\r')
+            keyboard.send_text('\r')
             def select(*args, **kwargs):
                 return original_select(*args, input=keyboard, output=DummyOutput(), **kwargs)
             with patch.object(downloader.questionary, 'select', side_effect=select):
                 downloader.configure_retries()
-        self.assertEqual(downloader.retry_limit(), 1)
-        self.assertEqual(dotenv_values('.env')['MAX_RETRIES'], '1')
+        self.assertEqual(downloader.retry_limit(), 0)
+        self.assertEqual(dotenv_values('.env')['MAX_RETRIES'], '0')
 
     def test_menu_all_modes_and_settings_dispatch(self):
         Path('users.csv').write_text('email\nuser@example.invalid\n')

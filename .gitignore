@@ -18,6 +18,7 @@ dist/
 /downloads/
 /shared/
 /logs/
+.disk-downloader/
 *.log
 *.csv
 !users.example.csv
@@ -29,3 +30,4 @@ dist/
 Thumbs.db
 
 /downloader2.py
+AGENTS.md

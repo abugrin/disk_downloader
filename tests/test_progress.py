@@ -34,13 +34,11 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.previous_cwd = Path.cwd()
         os.chdir(self.temp.name)
-        downloader.directories.clear()
         downloader.sem = asyncio.Semaphore(downloader.MAX_STREAMS)
 
     async def asyncTearDown(self):
         os.chdir(self.previous_cwd)
         self.temp.cleanup()
-        downloader.directories.clear()
         self.assertFalse(any(thread.name == 'downloader-status' for thread in threading.enumerate()))
 
     def client(self, listdir, download):
@@ -55,12 +53,10 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_repeats_during_blocking_auth_listing_and_downloads(self):
         observer = StatusObserver({
             'auth': (['этап: получение токена'], 3),
-            'directories': (['этап: поиск папок', "текущий путь: 'disk:/slow'"], 2),
-            'files': (['этап: поиск файлов', "текущий путь: '/'"], 2),
+            'directories': (['этап: поиск файлов и папок', "текущий путь: 'disk:/slow'"], 2),
             'downloads': (['этап: скачивание', 'файлов завершено: 2/3', 'скачано: 1, ошибок: 1',
                            'в работе: 1, в очереди: 0', "самый долгий файл: '/slow/slow.txt'"], 2),
         })
-        calls = {}
         auth_reported = False
 
         def token(client_id, client_secret, email):
@@ -72,15 +68,11 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await asyncio.to_thread(observer.events[name].wait, 2), name)
 
         async def listdir(path):
-            calls[path] = calls.get(path, 0) + 1
             if path == '/':
-                if calls[path] == 2:
-                    await wait_for_status('files')
                 yield SimpleNamespace(type='dir', path='disk:/Файлы Мессенджера')
                 yield SimpleNamespace(type='dir', path='disk:/slow')
             else:
-                if calls[path] == 1:
-                    await wait_for_status('directories')
+                await wait_for_status('directories')
                 for name in ['fast.txt', 'failed.txt', 'slow.txt']:
                     yield SimpleNamespace(type='file', path=f'disk:/slow/{name}')
 
@@ -109,13 +101,12 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(auth_reported)
         self.assertTrue(all(event.is_set() for event in observer.events.values()))
         self.assertTrue(all('папок найдено: 1, просмотрено: 1' in msg for msg in observer.messages['directories']))
-        self.assertNotIn('disk:/Файлы Мессенджера', calls)
         self.assertEqual(Path('test@example.invalid/slow/slow.txt').read_text(), '/slow/slow.txt')
         self.assertIn('файлов завершено: 3/3 (100.0%)', '\n'.join(logs.output))
         self.assertIn('скачано: 2, ошибок: 1', '\n'.join(logs.output))
 
     async def test_cancellation_stops_status_output(self):
-        observer = StatusObserver({'waiting': (['этап: поиск папок', "текущий путь: '/'"], 2)})
+        observer = StatusObserver({'waiting': (['этап: поиск файлов и папок', "текущий путь: '/'"], 2)})
         never = asyncio.Event()
 
         async def listdir(path):
@@ -164,7 +155,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         client = self.client(listdir, download)
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret', 'MAX_RETRIES': '1'}, clear=True),
             patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'AsyncClient', return_value=client),
             patch.object(downloader.asyncio, 'sleep', side_effect=wait_for_status),
@@ -177,11 +168,13 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
                 downloader.log.removeHandler(observer)
         self.assertEqual(attempts, 2)
         self.assertEqual(Path('test@example.invalid/file.txt').read_text(), 'complete')
-        self.assertIn('Повтор 1/5', '\n'.join(logs.output))
+        self.assertIn('Повтор 1/1', '\n'.join(logs.output))
 
-    async def test_exception_stops_status_thread(self):
-        with self.assertLogs('Downloader'), self.assertRaisesRegex(RuntimeError, 'test'):
-            with downloader.ProgressReporter('test@example.invalid', 0.01):
+    async def test_fast_phase_changes_and_exception_do_not_emit_status(self):
+        with self.assertNoLogs('Downloader'), self.assertRaisesRegex(RuntimeError, 'test'):
+            with downloader.ProgressReporter('test@example.invalid', 30) as progress:
+                for phase in ('проверка токена', 'получение информации о Диске', 'поиск файлов и папок'):
+                    progress.phase(phase)
                 raise RuntimeError('test')
 
 

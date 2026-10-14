@@ -100,14 +100,12 @@ class BatchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.previous_cwd = Path.cwd()
         os.chdir(self.temp.name)
-        downloader.directories.clear()
         downloader.sem = asyncio.Semaphore(downloader.MAX_STREAMS)
         self.listed = []
 
     def tearDown(self):
         os.chdir(self.previous_cwd)
         self.temp.cleanup()
-        downloader.directories.clear()
 
     def make_client(self, email, tree, failed_file=None, listing_error=False):
         async def listdir(path):
@@ -168,7 +166,7 @@ class BatchTests(unittest.TestCase):
         self.assertNotIn((users[3], 'disk:/old'), self.listed)
         self.assertFalse(Path(users[3], 'old').exists())
         output = '\n'.join(logs.output)
-        self.assertIn('Users: 4; successful: 1; failed: 3', output)
+        self.assertIn('Пользователей: 4; успешно: 1; с ошибками: 3', output)
         self.assertNotIn('must-not-be-logged', output)
 
     def test_colliding_user_folder_names_do_not_overwrite_each_other(self):
@@ -187,7 +185,7 @@ class BatchTests(unittest.TestCase):
         files = list(Path.cwd().glob('*/same.txt'))
         self.assertEqual(len(files), 2)
         self.assertEqual({path.read_text() for path in files}, set(users))
-        self.assertIn('Users: 2; successful: 2; failed: 0', '\n'.join(logs.output))
+        self.assertIn('Пользователей: 2; успешно: 2; с ошибками: 0', '\n'.join(logs.output))
 
     def test_cancellation_stops_batch(self):
         with (

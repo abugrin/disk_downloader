@@ -1,12 +1,12 @@
 [project]
 name = "yandex-disk-downloader"
-version = "0.1.0"
+version = "0.2.0"
 description = "Download an organization user's Yandex Disk with portable local paths"
 readme = "README.MD"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "httpx>=0.28,<0.29",
-    "python-dotenv>=1.1,<2",
+    "python-dotenv>=1.2.4,<2",
     "questionary>=2.1,<3",
     "yadisk[async-defaults]==3.2.0",
 ]

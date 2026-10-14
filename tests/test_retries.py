@@ -75,19 +75,21 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.sleep = self.enterContext(patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock))
         self.jitter = self.enterContext(patch.object(downloader, 'uniform', return_value=0))
         self.logs = self.enterContext(self.assertLogs('Downloader'))
+        self.enterContext(patch.dict(os.environ, {'MAX_RETRIES': '3'}))
         downloader.sem = asyncio.Semaphore(downloader.MAX_STREAMS)
-        downloader.directories.clear()
         self.addCleanup(self.temp.cleanup)
-        self.addCleanup(downloader.directories.clear)
 
     def delays(self):
         return [call.args[0] for call in self.sleep.await_args_list]
 
     async def test_configured_retry_limits_apply_to_api_stream_and_oauth(self):
-        for limit in range(1, 6):
+        for configured, limit in [(None, 0), ('0', 0), ('1', 1), ('2', 2), ('3', 3),
+                                  ('4', 3), ('5', 3), ('100', 3)]:
             for endpoint in ['metadata', 'stream', 'oauth']:
-                with self.subTest(limit=limit, endpoint=endpoint), patch.dict(os.environ, {'MAX_RETRIES': str(limit)}):
+                environment = {} if configured is None else {'MAX_RETRIES': configured}
+                with self.subTest(configured=configured, endpoint=endpoint), patch.dict(os.environ, environment, clear=True):
                     self.sleep.reset_mock()
+                    self.jitter.reset_mock()
                     failures = 0
                     def handler(request):
                         nonlocal failures
@@ -109,8 +111,13 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                     if endpoint == 'oauth':
                         self.assertTrue(auth.is_closed)
                     self.assertEqual(failures, limit + 1)
-                    self.assertEqual(self.delays(), list(downloader.RETRY_DELAYS[:limit]))
-                    self.assertIn(f'Повтор {limit}/{limit}', '\n'.join(self.logs.output))
+                    self.assertEqual(self.delays(), [2, 4, 8][:limit])
+                    if limit:
+                        self.assertIn(f'Повтор {limit}/{limit}', '\n'.join(self.logs.output))
+                    else:
+                        self.sleep.assert_not_awaited()
+                        self.jitter.assert_not_called()
+        self.assertNotIn('Повтор 0/0', '\n'.join(self.logs.output))
 
     async def test_smaller_retry_limit_preserves_retry_after_and_jitter(self):
         with patch.dict(os.environ, {'MAX_RETRIES': '1'}):
@@ -125,7 +132,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(operation.await_count, 2)
                 self.assertEqual(self.delays(), [expected])
 
-    async def test_all_transient_statuses_have_six_attempts_without_nested_sdk_retries(self):
+    async def test_all_transient_statuses_have_four_attempts_without_nested_sdk_retries(self):
         for status in [408, 429, 500, 502, 503, 504]:
             for endpoint in ['metadata', 'download_link', 'stream']:
                 with self.subTest(status=status, endpoint=endpoint):
@@ -147,15 +154,15 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                                 await downloader.with_retries(client.get_disk_info, 'метаданные')
                             else:
                                 await downloader.download_file(client, '/file', self.root / 'file', '[1/1]')
-                    self.assertEqual(len(responses), 6)
-                    self.assertEqual(len(calls), 12 if endpoint == 'stream' else 6)
+                    self.assertEqual(len(responses), 4)
+                    self.assertEqual(len(calls), 8 if endpoint == 'stream' else 4)
                     self.assertTrue(all(response.is_closed for response in responses))
-                    self.assertEqual(self.delays(), [2, 4, 8, 16, 32])
+                    self.assertEqual(self.delays(), [2, 4, 8])
                     self.assertFalse(list(self.root.iterdir()))
         output = '\n'.join(self.logs.output)
         self.assertNotIn('must-not-be-logged', output)
-        self.assertIn('Повтор 5/5', output)
-        self.assertNotIn('Повтор 6/5', output)
+        self.assertIn('Повтор 3/3', output)
+        self.assertNotIn('Повтор 4/3', output)
 
     async def test_jitter_bounds_and_retry_after_larger_than_randomized_backoff(self):
         for fraction in [0, 0.125, 0.25]:
@@ -165,10 +172,10 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             operation = AsyncMock(side_effect=TimeoutError('must-not-be-logged'))
             with self.assertRaises(TimeoutError):
                 await downloader.with_retries(operation, 'тайм-аут')
-            self.assertEqual(operation.await_count, 6)
-            self.assertEqual(self.delays(), [base * (1 + fraction) for base in [2, 4, 8, 16, 32]])
+            self.assertEqual(operation.await_count, 4)
+            self.assertEqual(self.delays(), [base * (1 + fraction) for base in [2, 4, 8]])
             self.assertEqual([c.args for c in self.jitter.call_args_list],
-                             [(0, base * 0.25) for base in [2, 4, 8, 16, 32]])
+                             [(0, base * 0.25) for base in [2, 4, 8]])
 
         now = datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc).timestamp()
         cases = [('60', 60), ('1', 2.5), ('invalid', 2.5),
@@ -225,15 +232,15 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                 async with disk_client(handler) as client:
                     with self.assertRaises(Exception):
                         await downloader.with_retries(client.get_disk_info, 'метаданные')
-                self.assertEqual(calls, 6)
-                self.assertEqual(self.delays(), [2, 4, 8, 16, 32])
+                self.assertEqual(calls, 4)
+                self.assertEqual(self.delays(), [2, 4, 8])
         self.assertNotIn('must-not-be-logged', '\n'.join(self.logs.output))
 
-    async def test_sixth_attempt_can_succeed_and_no_wait_follows_success(self):
-        operation = AsyncMock(side_effect=[TimeoutError()] * 5 + ['done'])
+    async def test_fourth_attempt_can_succeed_and_no_wait_follows_success(self):
+        operation = AsyncMock(side_effect=[TimeoutError()] * 3 + ['done'])
         self.assertEqual(await downloader.with_retries(operation, 'операция'), 'done')
-        self.assertEqual(operation.await_count, 6)
-        self.assertEqual(self.delays(), [2, 4, 8, 16, 32])
+        self.assertEqual(operation.await_count, 4)
+        self.assertEqual(self.delays(), [2, 4, 8])
 
     async def test_local_errors_and_cancellation_are_not_retried(self):
         for error in [PermissionError(), OSError('disk full'), ValueError(), asyncio.CancelledError()]:
@@ -286,7 +293,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         async with disk_client(handler) as client:
             self.assertFalse(await downloader.safe_download(client, '/file', destination, '[1/1]', progress,
                                                             resource=ResourceObject({'size': 8})))
-        self.assertEqual(len(streams), 6)
+        self.assertEqual(len(streams), 4)
         self.assertTrue(all(stream.closed for stream in streams))
         self.assertEqual(destination.read_bytes(), b'existing copy')
         self.assertEqual(list(self.root.iterdir()), [destination])
@@ -320,7 +327,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
 
         progress = Mock()
         async with disk_client(handler) as client:
-            files = await downloader.list_files(client, progress)
+            files = (await downloader.list_resources(client, progress)).files
         self.assertEqual(offsets, [0, 1, 0, 1])
         self.assertEqual([file.path for file in files], ['disk:/0.txt', 'disk:/1.txt'])
         self.assertEqual(sum(c.kwargs.get('files', 0) for c in progress.count.call_args_list), 2)
@@ -347,8 +354,8 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(httpx.HTTPError):
                         await downloader.get_service_token('test-id', 'test-secret', 'user@example.invalid')
                 self.assertTrue(client.is_closed)
-                self.assertEqual(calls, 6)
-                self.assertEqual(self.delays(), [40] * 5 if isinstance(failure, int) else [2, 4, 8, 16, 32])
+                self.assertEqual(calls, 4)
+                self.assertEqual(self.delays(), [40] * 3 if isinstance(failure, int) else [2, 4, 8])
 
     async def test_authentication_rejections_and_invalid_tokens_are_not_retried(self):
         cases = [(400, {}), (401, {}), (403, {}), (200, {}), (200, {'access_token': ''}),
@@ -404,7 +411,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                                    event_hooks={'response': [downloader.check_transient_response]})
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret', 'MAX_RETRIES': '3'}, clear=True),
             patch.object(downloader.httpx, 'AsyncClient', return_value=auth),
             patch.object(downloader, 'AsyncHTTPXSession', return_value=session),
         ):
@@ -413,7 +420,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((destination / '0.txt').read_bytes(), b'complete')
         self.assertEqual(counts, {
             'auth': 2, '/v1/disk/operations/0000': 2, '/v1/disk': 2,
-            '/v1/disk/resources': 3, '/v1/disk/resources/download': 4, '/file': 3,
+            '/v1/disk/resources': 2, '/v1/disk/resources/download': 4, '/file': 3,
         })
         self.assertEqual(self.delays(), [2, 2, 2, 2, 2, 4, 8])
         self.assertTrue(auth.is_closed)

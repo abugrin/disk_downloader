@@ -79,7 +79,6 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.previous_cwd = Path.cwd()
         self.temp = tempfile.TemporaryDirectory()
         os.chdir(self.temp.name)
-        downloader.directories.clear()
         downloader.sem = asyncio.Semaphore(downloader.MAX_STREAMS)
         self.email = 'test@example.invalid'
         self.listed_paths = []
@@ -87,7 +86,6 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         os.chdir(self.previous_cwd)
         self.temp.cleanup()
-        downloader.directories.clear()
 
     async def run_main(self, tree, download):
         async def listdir(path):
@@ -136,7 +134,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Path(self.email, 'root.txt').read_text(), '/root.txt')
         self.assertEqual(Path(self.email, 'good/ok.txt').read_text(), '/good/ok.txt')
         output = '\n'.join(logs.output)
-        self.assertIn('Downloaded 2 files; failed files: 2; failed directories: 1', output)
+        self.assertIn('Скачано файлов: 2; ошибок скачивания: 2; ошибок создания папок: 1', output)
         self.assertIn('blocked', output)
         self.assertIn('/failed.txt', output)
         self.assertNotIn('must-not-be-logged', output)
@@ -148,7 +146,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs('Downloader') as logs:
             await self.run_main({'/': [('file', 'disk:/root.txt')]}, download)
         self.assertEqual(Path(self.email, 'root.txt').read_text(), 'downloaded')
-        self.assertIn('Downloaded 1 files; failed files: 0; failed directories: 0', '\n'.join(logs.output))
+        self.assertIn('Скачано файлов: 1; ошибок скачивания: 0; ошибок создания папок: 0', '\n'.join(logs.output))
 
     async def test_cancellation_propagates(self):
         client = SimpleNamespace(download=AsyncMock(side_effect=asyncio.CancelledError()))
@@ -175,7 +173,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
             {'/CON.txt', '/bad . /a?.txt', '/bad . /a*.txt'},
         )
         self.assertIn('disk:/bad . ', self.listed_paths)
-        self.assertIn('Downloaded 3 files; failed files: 0', '\n'.join(logs.output))
+        self.assertIn('Скачано файлов: 3; ошибок скачивания: 0', '\n'.join(logs.output))
 
     async def test_messenger_folders_are_not_traversed_or_downloaded(self):
         tree = {
@@ -210,14 +208,16 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mappings[0], mappings[1])
         self.assertEqual(len({name.casefold() for name in mappings[0].values()}), 3)
 
-    async def test_empty_disk_creates_root_and_clears_previous_directories(self):
-        downloader.directories.append(SimpleNamespace(path='disk:/stale'))
+    async def test_empty_disk_creates_root_without_reusing_previous_listing(self):
+        with self.assertLogs('Downloader'):
+            await self.run_main({'/': [('dir', 'disk:/stale')]}, AsyncMock())
+        self.listed_paths.clear()
         with self.assertLogs('Downloader') as logs:
             client = await self.run_main({}, AsyncMock())
         client.download.assert_not_awaited()
         self.assertTrue(Path(self.email).is_dir())
         self.assertNotIn('disk:/stale', self.listed_paths)
-        self.assertIn('Downloaded 0 files; failed files: 0', '\n'.join(logs.output))
+        self.assertIn('Скачано файлов: 0; ошибок скачивания: 0', '\n'.join(logs.output))
 
     async def test_concurrent_downloads_respect_stream_limit(self):
         active = maximum = 0

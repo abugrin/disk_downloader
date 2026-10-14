@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,8 @@ class TokenResponseTests(unittest.IsolatedAsyncioTestCase):
                     token = await downloader.get_service_token('id', 'secret', 'reader@example.invalid')
                 self.assertEqual(token.expires_at, 1000 + ttl)
                 self.assertEqual(token.refresh_at, 1000 + ttl - margin)
+                self.assertEqual(token.expires_at_wall, -1000000 + ttl)
+                self.assertEqual(token.refresh_at_wall, -1000000 + ttl - margin)
                 self.assertNotIn('private-token', repr(token))
                 self.assertTrue(client.is_closed)
 
@@ -74,6 +77,7 @@ class TokenManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.clock = Clock()
         self.enterContext(patch.object(downloader, 'monotonic', self.clock))
+        self.enterContext(patch.object(downloader, 'time', self.clock))
         self.logs = self.enterContext(self.assertLogs('Downloader'))
         self.manager = downloader.ServiceTokenManager('id', 'secret', 'reader@example.invalid')
 
@@ -106,8 +110,10 @@ class TokenManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('обновлён', '\n'.join(self.logs.output))
 
     async def test_failed_refresh_has_shared_cooldown_and_never_returns_expired_token(self):
+        rejection = httpx.HTTPStatusError('private-secret', request=httpx.Request('POST', 'https://example.invalid'),
+                                          response=httpx.Response(401))
         with patch.object(downloader, 'get_service_token', side_effect=[
-            self.clock.token('private-old'), TimeoutError('private-secret'), TimeoutError('private-secret'),
+            self.clock.token('private-old'), TimeoutError('private-secret'), rejection,
         ]) as fetch:
             await self.manager.get_token()
             self.clock.now += 3300
@@ -140,18 +146,22 @@ class TokenManagerTests(unittest.IsolatedAsyncioTestCase):
         def handler(request):
             nonlocal calls
             calls += 1
-            return httpx.Response(503)
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        with (patch.object(downloader.httpx, 'AsyncClient', return_value=client),
+            if calls <= 4:
+                return httpx.Response(503)
+            return httpx.Response(200, json={'access_token': 'private-new', 'expires_in': 3600})
+        clients = [httpx.AsyncClient(transport=httpx.MockTransport(handler)) for _ in range(2)]
+        with (patch.dict(os.environ, {'MAX_RETRIES': '3'}),
+              patch.object(downloader.httpx, 'AsyncClient', side_effect=clients),
               patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep,
               patch.object(downloader, 'uniform', return_value=0)):
             errors = await asyncio.gather(*(
                 downloader.with_retries(self.manager.get_token, 'test request') for _ in range(10)
             ), return_exceptions=True)
-        self.assertEqual(calls, 6)
-        self.assertEqual([call.args[0] for call in sleep.await_args_list], [2, 4, 8, 16, 32])
-        self.assertTrue(all(isinstance(error, downloader.TokenRefreshError) for error in errors))
-        self.assertTrue(client.is_closed)
+        self.assertEqual(calls, 5)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [2, 4, 8, 30])
+        self.assertEqual(sum(isinstance(error, downloader.TokenRefreshError) for error in errors), 1)
+        self.assertEqual(errors.count('private-new'), 9)
+        self.assertTrue(all(client.is_closed for client in clients))
 
     async def test_request_hook_does_not_add_auth_to_personal_download_or_cross_host_redirect(self):
         seen = []
@@ -287,7 +297,7 @@ class TokenLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     self.assertTrue(await downloader.main('reader@example.invalid', Path(directory),
                                                           vdhash='SharedHash' if shared else None))
-                self.assertGreaterEqual(len(issued), 5)
+                self.assertGreaterEqual(len(issued), 4)
                 self.assertGreater(clock.now - 1000, 3600)
                 self.assertEqual({path.name: path.read_bytes() for path in Path(directory).iterdir()},
                                  {'0.txt': b'complete', '1.txt': b'complete'})
