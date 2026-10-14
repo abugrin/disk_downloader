@@ -13,6 +13,7 @@ from yadisk.objects import ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 import downloader
+from environment_fixtures import isolated_environment
 
 
 class BrokenStream(httpx.AsyncByteStream):
@@ -87,7 +88,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                                   ('4', 3), ('5', 3), ('100', 3)]:
             for endpoint in ['metadata', 'stream', 'oauth']:
                 environment = {} if configured is None else {'MAX_RETRIES': configured}
-                with self.subTest(configured=configured, endpoint=endpoint), patch.dict(os.environ, environment, clear=True):
+                with self.subTest(configured=configured, endpoint=endpoint), isolated_environment(environment):
                     self.sleep.reset_mock()
                     self.jitter.reset_mock()
                     failures = 0
@@ -411,7 +412,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                                    event_hooks={'response': [downloader.check_transient_response]})
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret', 'MAX_RETRIES': '3'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret', 'MAX_RETRIES': '3'}),
             patch.object(downloader.httpx, 'AsyncClient', return_value=auth),
             patch.object(downloader, 'AsyncHTTPXSession', return_value=session),
         ):

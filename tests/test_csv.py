@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from environment_fixtures import isolated_environment
 from token_fixtures import make_token
 
 
@@ -148,7 +149,7 @@ class BatchTests(unittest.TestCase):
         with (
             patch('builtins.input', side_effect=AssertionError('CSV launch must not prompt')),
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}),
             patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', side_effect=lambda token, **kwargs: clients[token]),
             self.assertLogs('Downloader') as logs,
@@ -175,7 +176,7 @@ class BatchTests(unittest.TestCase):
         clients = {email: self.make_client(email, {'/': [('file', 'disk:/same.txt')]}) for email in users}
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}),
             patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', side_effect=lambda token, **kwargs: clients[token]),
             self.assertLogs('Downloader') as logs,

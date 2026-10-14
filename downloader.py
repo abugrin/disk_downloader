@@ -4,7 +4,7 @@
 #     "httpx>=0.28,<0.29",
 #     "python-dotenv>=1.2.4,<2",
 #     "questionary>=2.1,<3",
-#     "yadisk[async-defaults]==3.2.0",
+#     "yadisk[async-defaults]==3.4.1",
 # ]
 # ///
 
@@ -44,7 +44,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.2.0'
+VERSION = '0.5.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 TOKEN_LIFETIME = 3600.0
@@ -1518,7 +1518,16 @@ def create_run_log() -> logging.FileHandler:
         return handler
 
 
+def configure_console() -> None:
+    streams = {id(stream): stream for stream in (sys.stdout, sys.stderr, log_handler.stream)}
+    for stream in streams.values():
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
+            reconfigure(encoding='utf-8', errors='backslashreplace')
+
+
 def cli(argv: list[str] | None = None) -> int:
+    configure_console()
     try:
         handler = create_run_log()
     except OSError as error:

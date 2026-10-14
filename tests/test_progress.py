@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from environment_fixtures import isolated_environment
 from token_fixtures import make_token
 
 
@@ -86,7 +87,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         client = self.client(listdir, download)
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}),
             patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
             self.assertLogs('Downloader') as logs,
@@ -116,7 +117,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         client = self.client(listdir, AsyncMock())
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}),
             patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
             self.assertLogs('Downloader'),
@@ -155,7 +156,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         client = self.client(listdir, download)
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret', 'MAX_RETRIES': '1'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret', 'MAX_RETRIES': '1'}),
             patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'AsyncClient', return_value=client),
             patch.object(downloader.asyncio, 'sleep', side_effect=wait_for_status),

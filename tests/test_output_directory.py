@@ -14,6 +14,7 @@ from dotenv import dotenv_values, set_key
 from yadisk.objects import ResourceObject
 
 import downloader
+from environment_fixtures import isolated_environment
 from test_resume import CHILD
 from token_fixtures import make_token
 
@@ -66,7 +67,7 @@ class OutputSettingsTests(unittest.TestCase):
         os.chdir(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(os.chdir, self.old_cwd)
-        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(isolated_environment())
         self.output = self.enterContext(patch('sys.stdout', new_callable=io.StringIO))
 
     def answers(self, method, values):
@@ -78,7 +79,7 @@ class OutputSettingsTests(unittest.TestCase):
         with self.answers('select', ['custom']), self.answers('text', ['backups/2026']):
             downloader.configure_download_directory()
         self.assertEqual(downloader.download_directory(), Path.cwd() / 'backups/2026')
-        with patch.dict(os.environ, {}, clear=True):
+        with isolated_environment():
             self.assertEqual(downloader.download_directory(), Path.cwd() / 'backups/2026')
             self.assertEqual(downloader.retry_limit(), 0)
         with self.answers('select', ['default']):

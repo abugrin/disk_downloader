@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from environment_fixtures import isolated_environment
 from token_fixtures import make_token
 
 
@@ -101,7 +102,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         client.download.side_effect = download
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}),
             patch.object(downloader, 'get_service_token') as service,
             patch.object(downloader, 'AsyncClient', return_value=client),
         ):
@@ -239,7 +240,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_authentication_errors_stop_run_without_logging_secrets(self):
         with (
             patch.object(downloader, 'load_dotenv'),
-            patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True),
+            isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}),
             patch.object(downloader, 'get_service_token', side_effect=RuntimeError('secret-must-not-be-logged')),
             patch.object(downloader, 'AsyncClient') as client,
             self.assertLogs('Downloader') as logs,

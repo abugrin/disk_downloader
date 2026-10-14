@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import downloader
+from environment_fixtures import isolated_environment
 from token_fixtures import make_token
 
 
@@ -19,9 +20,7 @@ def resource(kind, path, size=4):
 
 class ListingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.environment = patch.dict(os.environ, {'MAX_RETRIES': '0'}, clear=True)
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
+        self.enterContext(isolated_environment({'MAX_RETRIES': '0'}))
         self.logs = patch.object(downloader.log_handler, 'stream', io.StringIO())
         self.logs.start()
         self.addCleanup(self.logs.stop)
@@ -99,15 +98,14 @@ class ListingDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'download'
         self.patches = [
-            patch.dict(os.environ, {'MAX_RETRIES': '0'}, clear=True),
+            isolated_environment({'MAX_RETRIES': '0'}),
             patch.object(downloader, 'load_credentials', return_value=('test-id', 'test-secret')),
             patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'disk_session', return_value=None),
             patch.object(downloader.log_handler, 'stream', io.StringIO()),
         ]
-        for mock in self.patches:
-            mock.start()
-            self.addCleanup(mock.stop)
+        for context in self.patches:
+            self.enterContext(context)
 
     def client(self, listdir, download):
         client = AsyncMock()

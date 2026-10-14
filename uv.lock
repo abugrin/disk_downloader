@@ -143,11 +143,11 @@ wheels = [
 
 [[package]]
 name = "yadisk"
-version = "3.2.0"
+version = "3.4.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/56/a7/d6c305b38f61c93cd5abbf41bc9b94a6ca983ebc20eef5c383f57744fdba/yadisk-3.2.0.tar.gz", hash = "sha256:c0e2bf02b9dc8429a1de06a833966b082440922b47d3863c6248b77a9ba52523", size = 123545, upload-time = "2025-02-03T16:26:15.317Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/41/a0080b950b406eb944f42d3feb9ba1a24e9d659a801d51f9af36048389c4/yadisk-3.4.1.tar.gz", hash = "sha256:17d9092c6566244253be8694505bfb52bc351f27ceb56041798df87d8992d39a", size = 142818, upload-time = "2026-04-16T08:10:59.942Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/7b/3f042f52bcb8f13ff0d875880a267ac4efe7432321d1d1902238893822ae/yadisk-3.2.0-py3-none-any.whl", hash = "sha256:cff5ef4f0c84ce1bc2b4ea8194981b20cd7666693596da632bc2784518c82b5a", size = 132034, upload-time = "2025-02-03T16:26:12.343Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/c1/1856886450cdc5f8de9b04c276529f41e565e3dc1d755f12715764ec2dd6/yadisk-3.4.1-py3-none-any.whl", hash = "sha256:1498c8b23731b4262ad29e11de053a57902ea17daaa8ba07de27d1525a4028ac", size = 140744, upload-time = "2026-04-16T08:10:58.017Z" },
 ]
 
 [package.optional-dependencies]
@@ -158,7 +158,7 @@ async-defaults = [
 
 [[package]]
 name = "yandex-disk-downloader"
-version = "0.2.0"
+version = "0.5.0"
 source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
@@ -172,5 +172,5 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "python-dotenv", specifier = ">=1.2.4,<2" },
     { name = "questionary", specifier = ">=2.1,<3" },
-    { name = "yadisk", extras = ["async-defaults"], specifier = "==3.2.0" },
+    { name = "yadisk", extras = ["async-defaults"], specifier = "==3.4.1" },
 ]

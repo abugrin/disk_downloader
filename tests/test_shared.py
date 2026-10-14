@@ -11,6 +11,7 @@ import httpx
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 import downloader
+from environment_fixtures import isolated_environment
 from token_fixtures import make_token
 from test_retries import BrokenStream
 
@@ -67,10 +68,10 @@ class SharedDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.old_cwd = Path.cwd()
         os.chdir(self.temp.name)
-        self.addCleanup(os.chdir, self.old_cwd)
         self.addCleanup(self.temp.cleanup)
+        self.addCleanup(os.chdir, self.old_cwd)
         self.enterContext(patch.object(downloader, 'load_dotenv'))
-        self.enterContext(patch.dict(os.environ, {'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}, clear=True))
+        self.enterContext(isolated_environment({'CLIENT_ID': 'test-id', 'CLIENT_SECRET': 'test-secret'}))
         self.token = self.enterContext(patch.object(downloader, 'get_service_token', return_value=make_token()))
         self.logs = self.enterContext(self.assertLogs('Downloader'))
         self.sleep = self.enterContext(patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock))

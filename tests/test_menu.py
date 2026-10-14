@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from dotenv import dotenv_values
 
 import downloader
+from environment_fixtures import isolated_environment
 from token_fixtures import make_token
 
 
@@ -21,7 +22,7 @@ class MenuTests(unittest.TestCase):
         os.chdir(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(os.chdir, self.old_cwd)
-        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(isolated_environment())
         self.output = self.enterContext(patch('sys.stdout', new_callable=io.StringIO))
 
     def answers(self, method, values):
@@ -78,7 +79,7 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(select.call_args.kwargs['choices'], ['0', '1', '2', '3'])
         self.assertEqual(select.call_args.kwargs['default'], '2')
         self.assertEqual(downloader.retry_limit(), 3)
-        with patch.dict(os.environ, {}, clear=True):
+        with isolated_environment():
             self.assertEqual(downloader.load_credentials(), ('test-id', 'fake-secret'))
             self.assertEqual(downloader.retry_limit(), 3)
         downloader.save_credentials('new-id', 'new-fake-secret')
@@ -123,7 +124,7 @@ class MenuTests(unittest.TestCase):
         with self.answers('select', ['0']) as select:
             downloader.configure_retries()
         self.assertEqual(select.call_args.kwargs['default'], '0')
-        with patch.dict(os.environ, {}, clear=True):
+        with isolated_environment():
             downloader.load_credentials()
             self.assertEqual(downloader.retry_limit(), 0)
 
@@ -157,7 +158,7 @@ class MenuTests(unittest.TestCase):
 
     def test_cli_defaults_to_no_retries_and_caps_env_without_rewriting_it(self):
         for value, retries in [(None, 0), ('4', 3), ('5', 3), ('100', 3)]:
-            with self.subTest(value=value), patch.dict(os.environ, {}, clear=True):
+            with self.subTest(value=value), isolated_environment():
                 original = 'OTHER=value\n' if value is None else f'OTHER=value\nMAX_RETRIES={value}\n'
                 Path('.env').write_text(original)
                 operation = AsyncMock(side_effect=TimeoutError)

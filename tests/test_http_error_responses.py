@@ -8,6 +8,7 @@ from yadisk import AsyncClient
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 import downloader
+from environment_fixtures import isolated_environment
 
 
 class ObservedStream(httpx.AsyncByteStream):
@@ -29,7 +30,7 @@ class ObservedStream(httpx.AsyncByteStream):
 
 class HTTPErrorResponseTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.enterContext(patch.dict(os.environ, {'MAX_RETRIES': '0'}, clear=True))
+        self.enterContext(isolated_environment({'MAX_RETRIES': '0'}))
 
     def sdk(self, handler):
         session = AsyncHTTPXSession(

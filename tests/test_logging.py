@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import downloader
+from environment_fixtures import isolated_environment
 
 
 class FileLoggingTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class FileLoggingTests(unittest.TestCase):
         os.chdir(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(os.chdir, self.old_cwd)
-        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(isolated_environment())
         self.console = io.StringIO()
         self.enterContext(patch.object(downloader.log_handler, 'stream', self.console))
         self.previous_handlers = list(downloader.log.handlers)
@@ -46,7 +47,8 @@ class FileLoggingTests(unittest.TestCase):
         self.assertIn(f'Версия {downloader.VERSION} | Лог запуска:', content.splitlines()[0])
         self.assertIn('Скачан файл: отчёт.txt', content)
         self.assertIn('Повтор запроса', content)
-        self.assertIn(str(files[0].resolve()), content)
+        logged_path = content.splitlines()[0].split('Лог запуска: ', 1)[1]
+        self.assertTrue(Path(logged_path).samefile(files[0]))
         self.assertIn('Завершение работы; код: 0', content)
 
     def test_equal_start_timestamps_do_not_overwrite_or_duplicate_log_records(self):
@@ -125,11 +127,38 @@ class FileLoggingTests(unittest.TestCase):
 
     def test_script_launches_from_another_directory_get_separate_logs(self):
         command = [sys.executable, '-B', str(Path(downloader.__file__).resolve()), '--help']
+        environment = dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0')
         for count in [1, 2]:
-            result = subprocess.run(command, capture_output=True, timeout=5)
+            result = subprocess.run(command, env=environment, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stderr, b'')
             self.assertEqual(len(self.logs()), count)
             self.assertIn(b'usage:', result.stdout)
             self.assertIn(f'Версия {downloader.VERSION}'.encode('utf-8'), result.stdout)
         for file in self.logs():
             self.assertIn('Завершение работы; код: 0', file.read_text(encoding='utf-8'))
+
+    def test_cli_prints_russian_to_redirected_stdout_and_stderr(self):
+        script = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+import downloader
+
+def run(argv):
+    print('Папка сохранения: загрузки')
+    print('Проверка сообщения об ошибке', file=sys.stderr)
+    downloader.log.warning('Повтор запроса')
+    return 0
+
+downloader.run_cli = run
+raise SystemExit(downloader.cli([]))
+'''
+        environment = dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0')
+        result = subprocess.run(
+            [sys.executable, '-B', '-c', script, str(Path(downloader.__file__).resolve().parent)],
+            env=environment, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8'))
+        self.assertIn('Папка сохранения: загрузки', result.stdout.decode('utf-8'))
+        self.assertIn('Повтор запроса', result.stdout.decode('utf-8'))
+        self.assertEqual(result.stderr.decode('utf-8').splitlines(), ['Проверка сообщения об ошибке'])
