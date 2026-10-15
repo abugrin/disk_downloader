@@ -46,7 +46,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.8.0'
+VERSION = '0.9.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 TOKEN_LIFETIME = 3600.0
@@ -390,7 +390,8 @@ class ServiceToken:
 
 
 async def get_service_token(client_id: str, client_secret: str, email: str) -> ServiceToken:
-    async with httpx.AsyncClient(timeout=30, event_hooks={'response': [check_transient_response]}) as client:
+    async with httpx.AsyncClient(timeout=30, verify=tls_verification(),
+                                 event_hooks={'response': [check_transient_response]}) as client:
         async def request() -> ServiceToken:
             started = monotonic()
             started_wall = time()
@@ -539,7 +540,7 @@ def disk_session(tokens: ServiceTokenManager | None = None) -> AsyncHTTPXSession
     hooks = {'response': [check_transient_response]}
     if tokens is not None:
         hooks['request'] = [tokens.authorize]
-    return AsyncHTTPXSession(event_hooks=hooks)
+    return AsyncHTTPXSession(verify=tls_verification(), event_hooks=hooks)
 
 
 class SharedDiskClient(AsyncClient):
@@ -1159,6 +1160,7 @@ async def download_user(
 
 async def download_users(users: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
     modified_since()
+    report_connection_settings()
     base = download_directory().resolve()
     with LocalPaths(base, persistent=True, state_dir=base / '.disk-downloader') as destinations:
         destinations.prepare('/' + email for email in users)
@@ -1182,6 +1184,7 @@ async def download_users(users: list[str], status_interval: float = STATUS_INTER
 
 async def download_shared_disks(email: str, vdhashes: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
     modified_since()
+    report_connection_settings()
     base = download_directory().resolve()
     shared_root = base / 'shared'
     ensure_safe_path(shared_root, base, include_leaf=True)
@@ -1420,6 +1423,21 @@ def modified_since() -> datetime | None:
     return parse_modified_since(os.getenv('MODIFIED_SINCE', ''))
 
 
+def tls_verification() -> bool:
+    load_dotenv(Path.cwd() / '.env', interpolate=False)
+    value = os.getenv('VERIFY_TLS', '').strip().casefold()
+    if value in ('', 'true'):
+        return True
+    if value == 'false':
+        return False
+    raise ValueError('VERIFY_TLS должен быть true или false')
+
+
+def report_connection_settings() -> None:
+    if not tls_verification():
+        log.warning('Проверка сертификатов отключена: подлинность сервера не проверяется')
+
+
 def save_settings(values: dict[str, str]) -> None:
     destination = Path.cwd() / '.env'
     with NamedTemporaryFile(dir=destination.parent, prefix='.env-', suffix='.tmp', delete=False) as file:
@@ -1499,6 +1517,28 @@ def configure_credentials() -> None:
     print(f'Настройки сохранены в {Path.cwd() / ".env"}')
 
 
+def configure_connection() -> None:
+    try:
+        current = tls_verification()
+    except ValueError:
+        current = True
+    selected = questionary.select(
+        'Настройки соединения — игнорировать ошибки сертификата?', choices=[
+            questionary.Choice('Нет — проверять сертификаты (по умолчанию)', 'true'),
+            questionary.Choice('Да — игнорировать ошибки сертификата', 'false'),
+            questionary.Choice('Назад', 'back'),
+        ], default='true' if current else 'false',
+        instruction='(↑/↓ — выбор, Enter — подтвердить)',
+    ).unsafe_ask()
+    if selected == 'back':
+        return
+    if selected not in ('true', 'false'):
+        raise ValueError('Неизвестный вариант проверки сертификатов')
+    save_settings({'VERIFY_TLS': selected})
+    state = 'включена' if selected == 'true' else 'отключена'
+    print(f'Проверка сертификатов: {state}. Настройка сохранена в {Path.cwd() / ".env"}')
+
+
 def terminal_menu(status_interval: float) -> int:
     result = 0
     choices = [
@@ -1510,6 +1550,7 @@ def terminal_menu(status_interval: float) -> int:
         questionary.Choice('Настроить количество повторов (retry)', 'retries'),
         questionary.Choice('Настроить папку загрузки', 'download_directory'),
         questionary.Choice('Настроить дату начала выгрузки', 'modified_since'),
+        questionary.Choice('Настройки соединения', 'connection'),
         questionary.Choice('Выход', 'exit'),
     ]
     while True:
@@ -1530,6 +1571,10 @@ def terminal_menu(status_interval: float) -> int:
             print(f'Дата изменения от: {cutoff.isoformat() if cutoff is not None else "без ограничений"}')
         except ValueError as error:
             print(str(error))
+        try:
+            print(f'Проверка сертификатов: {"включена" if tls_verification() else "отключена"}')
+        except ValueError as error:
+            print(str(error))
         action = questionary.select('Выберите действие:', choices=choices,
                                     instruction='(↑/↓ — выбор, Enter — подтвердить)').unsafe_ask()
         if action == 'exit':
@@ -1547,9 +1592,13 @@ def terminal_menu(status_interval: float) -> int:
             if action == 'modified_since':
                 configure_modified_since()
                 continue
+            if action == 'connection':
+                configure_connection()
+                continue
             retry_limit()
             download_directory()
             modified_since()
+            tls_verification()
             if action == 'users':
                 path = Path(questionary.path('CSV со списком email:').unsafe_ask()).expanduser()
                 users = read_users_csv(path)
@@ -1611,6 +1660,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         retry_limit()
         download_directory()
         modified_since()
+        tls_verification()
         if shared:
             email = validate_email(args.email)
             vdhashes = read_shared_disks_csv(args.vdhash_csv) if args.vdhash_csv is not None else [validate_vdhash(args.vdhash)]

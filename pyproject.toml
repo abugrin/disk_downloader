@@ -1,6 +1,6 @@
 [project]
 name = "yandex-disk-downloader"
-version = "0.8.0"
+version = "0.9.0"
 description = "Download an organization user's Yandex Disk with portable local paths"
 readme = "README.MD"
 requires-python = ">=3.13,<3.14"
