@@ -19,6 +19,8 @@ import ntpath
 import os
 import posixpath
 import re
+import socket
+import ssl
 import stat
 import sys
 import unicodedata
@@ -44,7 +46,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.7.0'
+VERSION = '0.8.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 TOKEN_LIFETIME = 3600.0
@@ -105,13 +107,11 @@ def sensitive_field(name: str) -> bool:
             or name.startswith(('xamz', 'xgoog')))
 
 
-def response_diagnostic(response: httpx.Response) -> str:
-    secrets: set[str] = set()
-    content: str | None = None
-    payload = None
-    parsed_json = False
+class DiagnosticRedactor:
+    def __init__(self) -> None:
+        self.secrets: set[str] = set()
 
-    def collect_json(value) -> None:
+    def collect_json(self, value) -> None:
         pending = [(value, False)]
         while pending:
             item, sensitive = pending.pop()
@@ -120,17 +120,71 @@ def response_diagnostic(response: httpx.Response) -> str:
             elif isinstance(item, list):
                 pending.extend((child, sensitive) for child in item)
             elif sensitive and isinstance(item, str) and item:
-                secrets.add(item)
+                self.secrets.add(item)
 
-    def collect_fields(fields) -> None:
+    def collect_fields(self, fields: Iterable[tuple[str, str]]) -> None:
         for key, value in fields:
             if sensitive_field(key) and value:
-                secrets.add(value)
+                self.secrets.add(value)
                 if key.casefold().endswith('authorization'):
-                    secrets.add(value.partition(' ')[2])
+                    self.secrets.add(value.partition(' ')[2])
                 if 'cookie' in key.casefold():
-                    secrets.update(part.partition('=')[2].strip() for part in value.split(';') if '=' in part)
+                    self.secrets.update(part.partition('=')[2].strip() for part in value.split(';') if '=' in part)
 
+    def collect_request(self, request: httpx.Request) -> None:
+        self.collect_fields(request.headers.multi_items())
+        self.collect_fields(request.url.params.multi_items())
+        self.secrets.update((request.url.username, request.url.password))
+        content_type = request.headers.get('Content-Type', '').split(';')[0].strip().casefold()
+        if content_type == 'application/x-www-form-urlencoded':
+            try:
+                form = parse_qs(request.content.decode('utf-8'))
+                self.collect_fields((key, value) for key, values in form.items() for value in values)
+            except (httpx.RequestNotRead, UnicodeError, ValueError):
+                pass
+        elif content_type == 'application/json':
+            try:
+                self.collect_json(json.loads(request.content))
+            except (httpx.RequestNotRead, ValueError, RecursionError):
+                pass
+
+    def text(self, value: str) -> str:
+        replacements = sorted({encoded for secret in self.secrets if secret
+                               for encoded in (secret, quote(secret, safe='', errors='replace'), quote_plus(secret, errors='replace'),
+                                               escape(secret), json.dumps(secret, ensure_ascii=False)[1:-1],
+                                               json.dumps(secret, ensure_ascii=True)[1:-1])}, key=len, reverse=True)
+        value = re.sub(r'[a-z][a-z0-9+.-]*:(?:\\?/){2}[^\s<>"\']+', '[URL скрыт]', value, flags=re.IGNORECASE)
+        for secret in replacements:
+            if '%' in secret:
+                value = re.sub(re.escape(secret), '[скрыто]', value, flags=re.IGNORECASE)
+            else:
+                value = value.replace(secret, '[скрыто]')
+        value = re.sub(r'\b(?:Bearer|OAuth|Basic|Api-Key)\s+[^\s,;}\]]+', '[авторизация скрыта]', value, flags=re.IGNORECASE)
+        value = re.sub(
+            r'(?i)(\b(?:proxy[-_]?authorization|authorization|cookie|set-cookie)["\']?\s*[:=]\s*)'
+            r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\r\n]+)', r'\1[скрыто]', value,
+        )
+        value = re.sub(
+            r'(?i)(\b(?:client[-_]secret|access[-_]token|refresh[-_]token|id[-_]token|subject[-_]token|password|passwd|api[-_]key|token|secret|signature|credential)\b["\']?\s*[:=]\s*)'
+            r'(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s,;}\]]+)', r'\1[скрыто]', value,
+        )
+        value = re.sub(r'\b(?:y[01]_[\w.-]+|t[01]\.[\w.-]+|AQAD[\w.-]+|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b', '[токен скрыт]', value)
+        return value
+
+    def json(self, value):
+        if isinstance(value, dict):
+            return {self.text(key): '[скрыто]' if sensitive_field(key) else self.json(item)
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.json(item) for item in value]
+        return self.text(value) if isinstance(value, str) else value
+
+
+def response_diagnostic(response: httpx.Response) -> str:
+    redactor = DiagnosticRedactor()
+    content: str | None = None
+    payload = None
+    parsed_json = False
     try:
         content = response.text
     except httpx.ResponseNotRead:
@@ -139,60 +193,21 @@ def response_diagnostic(response: httpx.Response) -> str:
         try:
             payload = json.loads(content)
             parsed_json = True
-            collect_json(payload)
+            redactor.collect_json(payload)
         except (ValueError, RecursionError):
             pass
         for match in re.finditer(r'(?s)(?=<([A-Za-z_][\w.:-]*)\b[^>]*>(.*?)</\1\s*>)', content):
             if sensitive_field(match[1].rsplit(':', 1)[-1]):
                 value = match[2].strip()
                 if value:
-                    secrets.update((value, unescape(value)))
-    collect_fields(response.headers.multi_items())
+                    redactor.secrets.update((value, unescape(value)))
+    redactor.collect_fields(response.headers.multi_items())
     try:
-        request = response.request
+        redactor.collect_request(response.request)
     except RuntimeError:
-        request = None
-    if request is not None:
-        collect_fields(request.headers.multi_items())
-        collect_fields(request.url.params.multi_items())
-        content_type = request.headers.get('Content-Type', '').split(';')[0].strip().casefold()
-        if content_type == 'application/x-www-form-urlencoded':
-            try:
-                form = parse_qs(request.content.decode('utf-8'))
-                collect_fields((key, value) for key, values in form.items() for value in values)
-            except (httpx.RequestNotRead, UnicodeError, ValueError):
-                pass
-        elif content_type == 'application/json':
-            try:
-                collect_json(json.loads(request.content))
-            except (httpx.RequestNotRead, ValueError, RecursionError):
-                pass
-    replacements = sorted({encoded for value in secrets if value
-                           for encoded in (value, quote(value, safe='', errors='replace'), quote_plus(value, errors='replace'),
-                                           escape(value), json.dumps(value, ensure_ascii=False)[1:-1],
-                                           json.dumps(value, ensure_ascii=True)[1:-1])}, key=len, reverse=True)
+        pass
 
-    def redact_text(value: str) -> str:
-        value = re.sub(r'https?:(?:\\?/){2}[^\s<>"\']+', '[URL скрыт]', value, flags=re.IGNORECASE)
-        for secret in replacements:
-            value = value.replace(secret, '[скрыто]')
-        value = re.sub(r'\b(?:Bearer|OAuth|Api-Key)\s+[^\s,;}\]]+', '[авторизация скрыта]', value, flags=re.IGNORECASE)
-        value = re.sub(
-            r'(?i)(\b(?:client_secret|access_token|refresh_token|id_token|subject_token|password|api_key|token|secret|signature|credential)\b["\']?\s*[:=]\s*)'
-            r'(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s,;}\]]+)', r'\1[скрыто]', value,
-        )
-        value = re.sub(r'\b(?:y[01]_[\w.-]+|t[01]\.[\w.-]+|AQAD[\w.-]+|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b', '[токен скрыт]', value)
-        return value
-
-    def redact_json(value):
-        if isinstance(value, dict):
-            return {redact_text(key): '[скрыто]' if sensitive_field(key) else redact_json(item)
-                    for key, item in value.items()}
-        if isinstance(value, list):
-            return [redact_json(item) for item in value]
-        return redact_text(value) if isinstance(value, str) else value
-
-    headers = json.dumps(redact_json(dict(response.headers)), ensure_ascii=False)
+    headers = json.dumps(redactor.json(dict(response.headers)), ensure_ascii=False)
     if content is None:
         failure = response.extensions.get('downloader_body_error')
         unavailable = 'тело ответа недоступно'
@@ -200,18 +215,67 @@ def response_diagnostic(response: httpx.Response) -> str:
             unavailable += f' (ошибка чтения: {failure})'
         return f'заголовки ответа={headers}; тело ответа={unavailable}'
     try:
-        body = json.dumps(redact_json(payload) if parsed_json else redact_text(content), ensure_ascii=False)
+        body = json.dumps(redactor.json(payload) if parsed_json else redactor.text(content), ensure_ascii=False)
     except RecursionError:
-        body = json.dumps(redact_text(content), ensure_ascii=False)
+        body = json.dumps(redactor.text(content), ensure_ascii=False)
     return f'заголовки ответа={headers}; тело ответа={body}'
 
 
-def sanitized_error(error: BaseException) -> str:
-    details = [type(error).__name__]
+def exception_chain(error: BaseException) -> list[BaseException]:
+    result: list[BaseException] = []
+    pending = [error]
     seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
         seen.add(id(current))
+        result.append(current)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+        pending.extend(arg for arg in reversed(current.args) if isinstance(arg, BaseException))
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        if cause is not None:
+            pending.append(cause)
+    return result
+
+
+def sanitized_error(error: BaseException, *, known_secrets: Iterable[str] = ()) -> str:
+    details = [type(error).__name__]
+    chain = exception_chain(error)
+    network_roots = [item for item in chain
+                     if isinstance(item, (*NETWORK_ERRORS, httpx.TransportError, ssl.SSLError, socket.gaierror, socket.herror))]
+    network = (bool(network_roots)
+               and not any(getattr(item, 'response', None) is not None for item in chain))
+    redactor = DiagnosticRedactor()
+    if network:
+        network_causes = {id(cause) for item in network_roots for cause in exception_chain(item)}
+        redactor.secrets.update(known_secrets)
+        redactor.secrets.add(os.getenv('CLIENT_SECRET', ''))
+        for item in chain:
+            try:
+                request = getattr(item, 'request', None)
+            except RuntimeError:
+                request = None
+            if isinstance(request, httpx.Request):
+                redactor.collect_request(request)
+        for item in chain:
+            details.append(type(item).__name__)
+            if (id(item) in network_causes and not isinstance(item, BaseExceptionGroup)
+                    and not (isinstance(item, OSError) and item.filename is not None)):
+                message = item.strerror if isinstance(item, OSError) and item.strerror else str(item)
+                if message:
+                    details.append('сообщение=' + json.dumps(redactor.text(message), ensure_ascii=False))
+            for name in ('winerror', 'verify_code'):
+                value = getattr(item, name, None)
+                if type(value) is int:
+                    details.append(f'{name}={value}')
+            message = getattr(item, 'verify_message', None)
+            if isinstance(message, str) and message:
+                details.append('verify_message=' + json.dumps(redactor.text(message), ensure_ascii=False))
+    for current in chain:
         response = getattr(current, 'response', None)
         response = getattr(response, '_response', response)
         status = getattr(response, 'status_code', getattr(response, 'status', None))
@@ -240,8 +304,9 @@ def sanitized_error(error: BaseException) -> str:
             details.append(f'errno={current.errno}')
         if isinstance(current, TokenRefreshError):
             details.append(current.diagnostic)
-        current = current.__cause__
-    return '; '.join(dict.fromkeys(value for value in details if value))
+    message = '; '.join(dict.fromkeys(value for value in details if value))
+    return ''.join(ascii(char)[1:-1] if unicodedata.category(char) in {'Cc', 'Cf', 'Zl', 'Zp'} else char
+                   for char in message)
 
 
 def retry_after_seconds(value: str | None) -> float:
@@ -424,18 +489,23 @@ class ServiceTokenManager:
             try:
                 token = await get_service_token(self._client_id, self._client_secret, self._email)
             except Exception as error:
-                reason = sanitized_error(error)
+                reason = sanitized_error(error, known_secrets=(
+                    self._client_secret, self._token.access_token if self._token is not None else '',
+                ))
                 retryable, retry_after, _ = retry_details(error)
                 cooldown = max(TOKEN_REFRESH_RETRY_INTERVAL, retry_after)
                 self._next_refresh_at = monotonic() + cooldown
                 self._next_refresh_at_wall = time() + cooldown
                 if retryable and self._valid_token():
-                    log.warning('Не удалось обновить сервисный токен (%s); следующая проверка через %.0f с',
+                    log.warning('Не удалось обновить сервисный токен (%s); используется текущий токен, пауза перед повторным запросом: %.0f с',
                                 reason, cooldown)
                     return self._token.access_token
                 if retryable:
-                    log.error('Нет действующего токена (%s); следующая общая попытка через %.0f с',
-                              reason, cooldown)
+                    if refreshing:
+                        log.error('Нет действующего токена (%s); повторный запрос возможен не раньше чем через %.0f с',
+                                  reason, cooldown)
+                    else:
+                        log.error('Сервисный токен не получен (%s)', reason)
                 else:
                     self._failure = reason
                     log.error('Восстановление авторизации завершилось постоянной ошибкой (%s)', reason)
@@ -970,7 +1040,7 @@ async def download_user(
         tokens = ServiceTokenManager(client_id, client_secret, email)
         token = await tokens.get_token()
     except Exception as error:
-        log.error('Не удалось получить сервисный токен (%s)', sanitized_error(error))
+        log.error('Выгрузка не начата: не удалось получить сервисный токен (%s)', sanitized_error(error))
         return False
 
     if vdhash is not None:

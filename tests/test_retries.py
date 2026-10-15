@@ -228,14 +228,17 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                 def handler(request):
                     nonlocal calls
                     calls += 1
-                    raise error_type('must-not-be-logged', request=request)
+                    request.headers['Authorization'] = 'OAuth must-not-be-logged'
+                    raise error_type('Connection failed: must-not-be-logged', request=request)
 
                 async with disk_client(handler) as client:
                     with self.assertRaises(Exception):
                         await downloader.with_retries(client.get_disk_info, 'метаданные')
                 self.assertEqual(calls, 4)
                 self.assertEqual(self.delays(), [2, 4, 8])
-        self.assertNotIn('must-not-be-logged', '\n'.join(self.logs.output))
+        diagnostic = '\n'.join(self.logs.output)
+        self.assertIn('Connection failed:', diagnostic)
+        self.assertNotIn('must-not-be-logged', diagnostic)
 
     async def test_fourth_attempt_can_succeed_and_no_wait_follows_success(self):
         operation = AsyncMock(side_effect=[TimeoutError()] * 3 + ['done'])

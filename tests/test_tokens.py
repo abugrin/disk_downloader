@@ -110,6 +110,7 @@ class TokenManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('обновлён', '\n'.join(self.logs.output))
 
     async def test_failed_refresh_has_shared_cooldown_and_never_returns_expired_token(self):
+        self.manager = downloader.ServiceTokenManager('id', 'private-secret', 'reader@example.invalid')
         rejection = httpx.HTTPStatusError('private-secret', request=httpx.Request('POST', 'https://example.invalid'),
                                           response=httpx.Response(401))
         with patch.object(downloader, 'get_service_token', side_effect=[

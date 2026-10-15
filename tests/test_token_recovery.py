@@ -1,7 +1,9 @@
 import asyncio
 import io
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -15,7 +17,8 @@ class TokenRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.wall_clock = 100000.0
         self.enterContext(patch.object(downloader, 'monotonic', lambda: self.clock))
         self.enterContext(patch.object(downloader, 'time', lambda: self.wall_clock))
-        self.enterContext(patch.object(downloader.log_handler, 'stream', io.StringIO()))
+        self.logs = io.StringIO()
+        self.enterContext(patch.object(downloader.log_handler, 'stream', self.logs))
         self.manager = downloader.ServiceTokenManager('id', 'secret', 'reader@example.invalid')
 
     def token(self, value):
@@ -31,6 +34,96 @@ class TokenRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.manager.get_token(), 'old')
         self.clock += 10
         self.wall_clock += 10
+
+    async def test_initial_failure_reports_exhausted_retries_without_promising_recovery(self):
+        for limit in [0, 1, 3]:
+            with self.subTest(limit=limit):
+                self.logs.seek(0)
+                self.logs.truncate()
+                manager = downloader.ServiceTokenManager('id', 'secret', 'reader@example.invalid')
+                requests = []
+
+                def handler(request):
+                    requests.append(request)
+                    raise httpx.ConnectError('Connection refused', request=request)
+
+                client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+                with (patch.dict(os.environ, {'MAX_RETRIES': str(limit)}),
+                      patch.object(downloader.httpx, 'AsyncClient', return_value=client),
+                      patch.object(downloader, 'uniform', return_value=0),
+                      patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep):
+                    with self.assertRaises(downloader.TokenRefreshError) as caught:
+                        await manager.get_token()
+                self.assertFalse(caught.exception.terminal)
+                self.assertEqual(len(requests), limit + 1)
+                self.assertEqual([call.args[0] for call in sleep.await_args_list],
+                                 list(downloader.RETRY_DELAYS[:limit]))
+                self.assertEqual(manager._refresh_delay(), 30)
+                self.assertIsNone(manager._token)
+                self.assertIsNone(manager._task)
+                message = self.logs.getvalue()
+                self.assertIn('Сервисный токен не получен (', message)
+                self.assertNotIn('через 30', message)
+                self.assertNotIn('следующая', message)
+                self.assertTrue(client.is_closed)
+
+    async def test_valid_token_refresh_failure_reports_fallback_and_preserves_cooldown(self):
+        self.manager._token = self.token('old')
+        with (patch.object(downloader, 'get_service_token', side_effect=TimeoutError) as issue,
+              patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep):
+            self.assertEqual(await self.manager.get_token(), 'old')
+            self.assertEqual(await self.manager.get_token(), 'old')
+        issue.assert_awaited_once()
+        sleep.assert_not_awaited()
+        self.assertEqual(self.manager._refresh_delay(), 30)
+        message = self.logs.getvalue()
+        self.assertIn('Не удалось обновить сервисный токен (', message)
+        self.assertIn('используется текущий токен, пауза перед повторным запросом: 30 с', message)
+        self.assertNotIn('следующая', message)
+
+    async def test_expired_token_failure_reports_conditional_recovery_and_waits_on_next_request(self):
+        self.manager._token = downloader.ServiceToken('expired', self.clock, self.clock)
+        with (patch.object(downloader, 'get_service_token',
+                           side_effect=[TimeoutError(), self.token('new')]) as issue,
+              patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep):
+            with self.assertRaises(downloader.TokenRefreshError) as caught:
+                await self.manager.get_token()
+            self.assertFalse(caught.exception.terminal)
+            sleep.assert_not_awaited()
+            issue.assert_awaited_once()
+            self.assertEqual(self.manager._refresh_delay(), 30)
+            message = self.logs.getvalue()
+            self.assertIn('Нет действующего токена (', message)
+            self.assertIn('повторный запрос возможен не раньше чем через 30 с', message)
+            self.assertNotIn('следующая', message)
+            self.assertEqual(await self.manager.get_token(), 'new')
+        self.assertEqual(issue.await_count, 2)
+        sleep.assert_awaited_once_with(30)
+
+    async def test_download_reports_not_started_when_initial_token_request_fails(self):
+        for vdhash in [None, 'testSharedDisk']:
+            with self.subTest(vdhash=vdhash), tempfile.TemporaryDirectory() as directory:
+                self.logs.seek(0)
+                self.logs.truncate()
+                root = Path(directory)
+                progress = downloader.ProgressReporter('reader@example.invalid', 30)
+                with (patch.object(downloader, 'modified_since', return_value=None),
+                      patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
+                      patch.object(downloader, 'get_service_token', side_effect=httpx.ConnectError('Connection refused')),
+                      patch.object(downloader, 'AsyncClient') as personal,
+                      patch.object(downloader, 'SharedDiskClient') as shared,
+                      patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep):
+                    result = await downloader.download_user(
+                        'reader@example.invalid', root, progress, vdhash,
+                        local_paths=downloader.LocalPaths(root),
+                    )
+                self.assertFalse(result)
+                personal.assert_not_called()
+                shared.assert_not_called()
+                sleep.assert_not_awaited()
+                message = self.logs.getvalue()
+                self.assertIn('Выгрузка не начата: не удалось получить сервисный токен (', message)
+                self.assertNotIn('через 30', message)
 
     async def test_expired_token_waits_for_one_shared_recovery_without_draining_queue(self):
         await self.prepare_expiry_during_cooldown()
