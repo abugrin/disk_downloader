@@ -277,19 +277,28 @@ class MenuTests(unittest.TestCase):
         self.assertIn('--email', stderr.getvalue())
 
     def test_repeated_menu_downloads_with_more_than_ten_files_use_new_semaphore(self):
-        active = maximum = 0
-        async def download(remote, local):
-            nonlocal active, maximum
-            active += 1
-            maximum = max(active, maximum)
-            await asyncio.sleep(0.001)
-            Path(local).write_text('complete')
-            active -= 1
+        runs = []
+        file_count = downloader.MAX_STREAMS + 4
         async def listdir(path):
-            for number in range(14):
+            for number in range(file_count):
                 yield SimpleNamespace(type='file', path=f'disk:/{number}.txt', size=8)
         def client_factory(**kwargs):
             client = AsyncMock()
+            state = SimpleNamespace(active=0, maximum=0, client=client,
+                                    semaphore=downloader.sem, loop=asyncio.get_running_loop())
+            runs.append(state)
+            started = asyncio.Event()
+            async def download(remote, local):
+                state.active += 1
+                state.maximum = max(state.active, state.maximum)
+                if state.active == downloader.MAX_STREAMS:
+                    started.set()
+                try:
+                    async with asyncio.timeout(5):
+                        await started.wait()
+                    Path(local).write_text('complete')
+                finally:
+                    state.active -= 1
             client.__aenter__.return_value = client
             client.check_token.return_value = True
             client.get_disk_info.return_value = SimpleNamespace(used_space=0)
@@ -302,9 +311,16 @@ class MenuTests(unittest.TestCase):
             self.answers('text', ['user@example.invalid', 'another@example.invalid']),
             patch.object(downloader, 'get_service_token', return_value=make_token()),
             patch.object(downloader, 'AsyncClient', side_effect=client_factory),
-            self.assertLogs('Downloader'),
+            self.assertLogs('Downloader') as logs,
         ):
-            self.assertEqual(downloader.terminal_menu(10), 0)
-        self.assertEqual(maximum, 10)
-        self.assertEqual(len(list(Path('user@example.invalid').iterdir())), 14)
-        self.assertEqual(len(list(Path('another@example.invalid').iterdir())), 14)
+            result = downloader.terminal_menu(10)
+        self.assertEqual(result, 0, '\n'.join(logs.output))
+        self.assertEqual(len(runs), 2)
+        self.assertIsNot(runs[0].semaphore, runs[1].semaphore)
+        self.assertIsNot(runs[0].loop, runs[1].loop)
+        for run in runs:
+            self.assertEqual(run.maximum, downloader.MAX_STREAMS)
+            self.assertEqual(run.client.download.await_count, file_count)
+            self.assertEqual(run.active, 0)
+        self.assertEqual(len(list(Path('user@example.invalid').iterdir())), file_count)
+        self.assertEqual(len(list(Path('another@example.invalid').iterdir())), file_count)

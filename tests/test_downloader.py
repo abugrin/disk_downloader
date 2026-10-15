@@ -221,19 +221,27 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Скачано файлов: 0; ошибок скачивания: 0', '\n'.join(logs.output))
 
     async def test_concurrent_downloads_respect_stream_limit(self):
-        active = maximum = 0
+        active = maximum = completed = 0
+        started = asyncio.Event()
 
         async def download(remote, local):
-            nonlocal active, maximum
+            nonlocal active, maximum, completed
             active += 1
             maximum = max(maximum, active)
-            await asyncio.sleep(0.01)
-            active -= 1
+            if active == downloader.MAX_STREAMS:
+                started.set()
+            try:
+                async with asyncio.timeout(5):
+                    await started.wait()
+                completed += 1
+            finally:
+                active -= 1
 
         files = [('file', f'disk:/{index}.txt') for index in range(downloader.MAX_STREAMS + 4)]
         with self.assertLogs('Downloader'):
             client = await self.run_main({'/': files}, download)
         self.assertEqual(client.download.await_count, len(files))
+        self.assertEqual(completed, len(files))
         self.assertEqual(maximum, downloader.MAX_STREAMS)
         self.assertEqual(active, 0)
 
