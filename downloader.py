@@ -24,7 +24,7 @@ import sys
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import escape, unescape
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -44,7 +44,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.5.0'
+VERSION = '0.6.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 TOKEN_LIFETIME = 3600.0
@@ -951,6 +951,7 @@ async def download_user(
     *, local_paths: LocalPaths | None = None,
 ) -> bool:
     start_time = time()
+    cutoff = modified_since()
     if output_dir is None:
         base = download_directory()
         output_dir = base / 'shared' / normalize_name(vdhash) if vdhash is not None else base / normalize_name(email)
@@ -990,13 +991,30 @@ async def download_user(
         disk_info: DiskInfoObject = await with_retries(client.get_disk_info, 'информация о Диске')
 
         log.info('Начало выгрузки: %s', f'Общий Диск {vdhash} (через {email})' if vdhash is not None else email)
+        if cutoff is not None:
+            log.info('Дата изменения от: %s', cutoff.isoformat())
         if disk_info.used_space:
             log.info(f'Занято на Диске: {round(disk_info.used_space / 1024 ** 2, 2)} МБ')
 
         log.info('Поиск файлов и папок...')
         progress.phase('поиск файлов и папок')
         listing = await list_resources(client, progress)
-        files_count = len(listing.files)
+        selected_files = listing.files
+        date_errors = 0
+        skipped_by_date = 0
+        if cutoff is not None:
+            selected_files = []
+            for item in listing.files:
+                modified = getattr(item, 'modified', None)
+                if not isinstance(modified, datetime) or modified.utcoffset() is None:
+                    date_errors += 1
+                    log.error('Не удалось проверить дату изменения %r: поле modified отсутствует или некорректно', item.path)
+                elif modified < cutoff:
+                    skipped_by_date += 1
+                else:
+                    selected_files.append(item)
+            log.info('По дате: пропущено %s; ошибок %s', skipped_by_date, date_errors)
+        files_count = len(selected_files)
         progress.total_files(files_count)
         log.info('Найдено папок: %s; файлов к скачиванию: %s; ошибок чтения: %s',
                  len(listing.directories), files_count, listing.failed_directories)
@@ -1030,7 +1048,7 @@ async def download_user(
 
         log.info('Скачивание файлов...')
         progress.phase('скачивание')
-        pending_files = iter(enumerate(listing.files, 1))
+        pending_files = iter(enumerate(selected_files, 1))
 
         async def worker() -> int:
             successful = 0
@@ -1060,15 +1078,17 @@ async def download_user(
         successful = sum(results)
         skipped = progress.skipped_files
         end_time = time()
+        date_summary = f'; пропущено по дате: {skipped_by_date}; ошибок даты: {date_errors}' if cutoff is not None else ''
         log.info(
-            'Скачано файлов: %s; ошибок скачивания: %s; ошибок создания папок: %s; уже скачано: %s; время: %s мин; ошибок чтения: %s',
+            'Скачано файлов: %s; ошибок скачивания: %s; ошибок создания папок: %s; уже скачано: %s; время: %s мин; ошибок чтения: %s%s',
             successful - skipped, files_count - successful, failed_directories, skipped,
-            round((end_time - start_time) / 60, 2), listing.failed_directories,
+            round((end_time - start_time) / 60, 2), listing.failed_directories, date_summary,
         )
-        return successful == files_count and failed_directories == 0 and listing.failed_directories == 0
+        return successful == files_count and failed_directories == 0 and listing.failed_directories == 0 and date_errors == 0
 
 
 async def download_users(users: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
+    modified_since()
     base = download_directory().resolve()
     with LocalPaths(base, persistent=True, state_dir=base / '.disk-downloader') as destinations:
         destinations.prepare('/' + email for email in users)
@@ -1091,6 +1111,7 @@ async def download_users(users: list[str], status_interval: float = STATUS_INTER
 
 
 async def download_shared_disks(email: str, vdhashes: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
+    modified_since()
     base = download_directory().resolve()
     shared_root = base / 'shared'
     ensure_safe_path(shared_root, base, include_leaf=True)
@@ -1312,6 +1333,23 @@ def download_directory() -> Path:
     return path
 
 
+def parse_modified_since(value: str) -> datetime | None:
+    value = value.strip()
+    if not value:
+        return None
+    if re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', value):
+        try:
+            return datetime.fromisoformat(value).replace(second=1, tzinfo=timezone(timedelta(hours=3)))
+        except ValueError:
+            pass
+    raise ValueError('Дата начала выгрузки должна быть существующей датой в формате yyyy-mm-dd')
+
+
+def modified_since() -> datetime | None:
+    load_dotenv(Path.cwd() / '.env', interpolate=False)
+    return parse_modified_since(os.getenv('MODIFIED_SINCE', ''))
+
+
 def save_settings(values: dict[str, str]) -> None:
     destination = Path.cwd() / '.env'
     with NamedTemporaryFile(dir=destination.parent, prefix='.env-', suffix='.tmp', delete=False) as file:
@@ -1371,6 +1409,17 @@ def configure_download_directory() -> None:
     print(f'Папка загрузки: {path}. Настройка сохранена в {Path.cwd() / ".env"}')
 
 
+def configure_modified_since() -> None:
+    load_dotenv(Path.cwd() / '.env', interpolate=False)
+    value = questionary.text(
+        'Дата начала выгрузки (yyyy-mm-dd; пусто — все даты):',
+        default=os.getenv('MODIFIED_SINCE', ''),
+    ).unsafe_ask().strip()
+    cutoff = parse_modified_since(value)
+    save_settings({'MODIFIED_SINCE': value})
+    print(f'Дата изменения от: {cutoff.isoformat() if cutoff is not None else "без ограничений"}. Настройка сохранена в {Path.cwd() / ".env"}')
+
+
 def configure_credentials() -> None:
     current_id, current_secret = load_credentials()
     client_id = questionary.text('CLIENT_ID:', default=current_id).unsafe_ask().strip()
@@ -1390,6 +1439,7 @@ def terminal_menu(status_interval: float) -> int:
         questionary.Choice('Настроить CLIENT_ID и CLIENT_SECRET', 'configure'),
         questionary.Choice('Настроить количество повторов (retry)', 'retries'),
         questionary.Choice('Настроить папку загрузки', 'download_directory'),
+        questionary.Choice('Настроить дату начала выгрузки', 'modified_since'),
         questionary.Choice('Выход', 'exit'),
     ]
     while True:
@@ -1403,6 +1453,11 @@ def terminal_menu(status_interval: float) -> int:
         print('Сервисное приложение: настроено' if configured else 'Сервисное приложение: не настроено')
         try:
             print(f'Повторов после первой попытки: {retry_limit()}')
+        except ValueError as error:
+            print(str(error))
+        try:
+            cutoff = modified_since()
+            print(f'Дата изменения от: {cutoff.isoformat() if cutoff is not None else "без ограничений"}')
         except ValueError as error:
             print(str(error))
         action = questionary.select('Выберите действие:', choices=choices,
@@ -1419,8 +1474,12 @@ def terminal_menu(status_interval: float) -> int:
             if action == 'download_directory':
                 configure_download_directory()
                 continue
+            if action == 'modified_since':
+                configure_modified_since()
+                continue
             retry_limit()
             download_directory()
+            modified_since()
             if action == 'users':
                 path = Path(questionary.path('CSV со списком email:').unsafe_ask()).expanduser()
                 users = read_users_csv(path)
@@ -1481,6 +1540,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         load_dotenv(Path.cwd() / '.env', interpolate=False)
         retry_limit()
         download_directory()
+        modified_since()
         if shared:
             email = validate_email(args.email)
             vdhashes = read_shared_disks_csv(args.vdhash_csv) if args.vdhash_csv is not None else [validate_vdhash(args.vdhash)]

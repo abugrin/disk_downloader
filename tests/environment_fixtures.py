@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 
-APPLICATION_VARIABLES = ('CLIENT_ID', 'CLIENT_SECRET', 'MAX_RETRIES', 'DOWNLOAD_DIR')
+APPLICATION_VARIABLES = ('CLIENT_ID', 'CLIENT_SECRET', 'MAX_RETRIES', 'DOWNLOAD_DIR', 'MODIFIED_SINCE')
 
 
 @contextmanager
