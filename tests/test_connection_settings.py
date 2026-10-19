@@ -144,7 +144,8 @@ class ConnectionSettingsTests(unittest.TestCase):
 
         with (
             patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
-            self.answers('select', ['connection', 'false', 'user', 'connection', 'true', 'shared', 'exit']) as select,
+            self.answers('select', ['settings', 'connection', 'false', 'back', 'user',
+                                    'settings', 'connection', 'true', 'back', 'shared', 'exit']) as select,
             self.answers('text', ['reader@example.invalid', 'reader@example.invalid', 'ExampleHash']),
             patch.object(downloader, 'download_users', side_effect=download) as users,
             patch.object(downloader, 'download_shared_disks', side_effect=download) as shared,
@@ -153,7 +154,8 @@ class ConnectionSettingsTests(unittest.TestCase):
         self.assertEqual(modes, [False, True])
         users.assert_awaited_once_with(['reader@example.invalid'], status_interval=30)
         shared.assert_awaited_once_with('reader@example.invalid', ['ExampleHash'], status_interval=30)
-        choice = next(choice for choice in select.call_args.kwargs['choices'] if choice.value == 'connection')
+        choice = next(choice for call in select.call_args_list for choice in call.kwargs['choices']
+                      if choice.value == 'connection')
         self.assertEqual(choice.title, 'Настройки соединения')
         self.assertIn('Проверка сертификатов: включена', self.output.getvalue())
         self.assertIn('Проверка сертификатов: отключена', self.output.getvalue())
@@ -162,7 +164,8 @@ class ConnectionSettingsTests(unittest.TestCase):
         Path('.env').write_text('VERIFY_TLS=invalid\n', encoding='utf-8')
         with (
             patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
-            self.answers('select', ['user', 'users', 'shared', 'shared_csv', 'connection', 'true', 'user', 'exit']),
+            self.answers('select', ['user', 'users', 'shared', 'shared_csv', 'settings',
+                                    'connection', 'true', 'back', 'user', 'exit']),
             self.answers('text', ['reader@example.invalid']),
             patch.object(downloader, 'download_users', new=AsyncMock(return_value=True)) as users,
             patch.object(downloader, 'download_shared_disks', new=AsyncMock(return_value=True)) as shared,

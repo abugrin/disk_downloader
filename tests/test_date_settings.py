@@ -125,13 +125,14 @@ class ModifiedSinceSettingsTests(unittest.TestCase):
             return True
         with (
             patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
-            self.answers('select', ['modified_since', 'user', 'exit']) as select,
+            self.answers('select', ['settings', 'modified_since', 'back', 'user', 'exit']) as select,
             self.answers('text', ['2026-10-01', 'reader@example.invalid']),
             patch.object(downloader, 'download_users', side_effect=download) as users,
         ):
             self.assertEqual(downloader.terminal_menu(30), 0)
         users.assert_awaited_once()
-        choice = next(choice for choice in select.call_args.kwargs['choices'] if choice.value == 'modified_since')
+        choice = next(choice for call in select.call_args_list for choice in call.kwargs['choices']
+                      if choice.value == 'modified_since')
         self.assertEqual(choice.title, 'Настроить дату начала выгрузки')
         self.assertIn('2026-10-01', self.output.getvalue())
 
@@ -139,7 +140,7 @@ class ModifiedSinceSettingsTests(unittest.TestCase):
         Path('.env').write_text('MODIFIED_SINCE=invalid\n')
         with (
             patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
-            self.answers('select', ['user', 'modified_since', 'user', 'exit']),
+            self.answers('select', ['user', 'settings', 'modified_since', 'back', 'user', 'exit']),
             self.answers('text', ['2026-10-01', 'reader@example.invalid']),
             patch.object(downloader, 'download_users', new=AsyncMock(return_value=True)) as users,
         ):

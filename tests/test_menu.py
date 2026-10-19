@@ -97,7 +97,7 @@ class MenuTests(unittest.TestCase):
                 return False
         with (
             patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
-            self.answers('select', ['retries', '1', 'user', 'exit']),
+            self.answers('select', ['settings', 'retries', '1', 'back', 'user', 'exit']),
             self.answers('text', ['user@example.invalid']),
             patch.object(downloader, 'download_users', side_effect=download),
             patch.object(downloader.asyncio, 'sleep', new_callable=AsyncMock) as sleep,
@@ -112,7 +112,7 @@ class MenuTests(unittest.TestCase):
 
     def test_invalid_retry_setting_can_be_repaired_from_menu(self):
         Path('.env').write_text('MAX_RETRIES=invalid\n')
-        with (self.answers('select', ['user', 'retries', '3', 'exit']),
+        with (self.answers('select', ['user', 'settings', 'retries', '3', 'back', 'exit']),
               patch.object(downloader, 'download_users') as download):
             self.assertEqual(downloader.terminal_menu(10), 0)
         download.assert_not_called()
@@ -213,10 +213,16 @@ class MenuTests(unittest.TestCase):
         Path('disks.csv').write_text('VDHASH\nDiskA\nDiskB\n')
         with (
             patch.object(downloader, 'load_credentials', return_value=('id', 'secret')),
-            self.answers('select', ['user', 'users', 'shared', 'shared_csv', 'configure', 'exit']),
+            self.answers('select', ['user', 'users', 'shared', 'shared_csv', 'settings',
+                                    'configure', 'retries', 'download_directory', 'modified_since',
+                                    'connection', 'back', 'exit']) as select,
             self.answers('text', ['user@example.invalid', 'reader@example.invalid', 'DiskA', 'reader@example.invalid']),
             self.answers('path', ['users.csv', 'disks.csv']),
             patch.object(downloader, 'configure_credentials') as configure,
+            patch.object(downloader, 'configure_retries') as retries,
+            patch.object(downloader, 'configure_download_directory') as directory,
+            patch.object(downloader, 'configure_modified_since') as date,
+            patch.object(downloader, 'configure_connection') as connection,
             patch.object(downloader, 'download_users', new=AsyncMock(return_value=True)) as users,
             patch.object(downloader, 'download_shared_disks', new=AsyncMock(return_value=True)) as shared,
         ):
@@ -225,7 +231,76 @@ class MenuTests(unittest.TestCase):
             users.assert_awaited_with(['user@example.invalid'], status_interval=3)
             self.assertEqual([call.args for call in shared.await_args_list],
                              [('reader@example.invalid', ['DiskA']), ('reader@example.invalid', ['DiskA', 'DiskB'])])
-            configure.assert_called_once()
+            for setting in (configure, retries, directory, date, connection):
+                setting.assert_called_once_with()
+        menus = [[choice.value for choice in call.kwargs['choices']] for call in select.call_args_list]
+        main_choices = ['user', 'users', 'shared', 'shared_csv', 'estimate', 'settings', 'exit']
+        settings_choices = ['configure', 'retries', 'download_directory', 'modified_since', 'connection', 'back']
+        self.assertEqual(menus, [main_choices] * 5 + [settings_choices] * 6 + [main_choices])
+
+    def test_settings_back_returns_to_main_without_changing_settings(self):
+        original = 'CLIENT_ID=fake-id\nCLIENT_SECRET=fake-secret\nMAX_RETRIES=2\n'
+        Path('.env').write_text(original)
+        with (self.answers('select', ['settings', 'back', 'exit']),
+              patch.object(downloader, 'save_settings') as save):
+            self.assertEqual(downloader.terminal_menu(30), 0)
+        save.assert_not_called()
+        self.assertEqual(Path('.env').read_text(), original)
+
+    def test_settings_errors_allow_another_setting_without_leaving_submenu(self):
+        for error in (ValueError('Invalid setting'), UnicodeError('Invalid encoding'), OSError('Failed save')):
+            with self.subTest(error=type(error).__name__):
+                with (
+                    self.answers('select', ['configure', 'connection', 'back']) as select,
+                    patch.object(downloader, 'configure_credentials', side_effect=error) as credentials,
+                    patch.object(downloader, 'configure_connection') as connection,
+                ):
+                    downloader.settings_menu()
+                credentials.assert_called_once_with()
+                connection.assert_called_once_with()
+                self.assertEqual(select.call_count, 3)
+                self.assertTrue(all(call.args[0] == 'Настройки:' for call in select.call_args_list))
+        self.assertIn('Invalid setting', self.output.getvalue())
+        self.assertIn('UTF-8', self.output.getvalue())
+        self.assertIn('OSError', self.output.getvalue())
+        self.assertFalse(Path('.env').exists())
+
+    def test_settings_interrupts_reach_existing_cli_handlers(self):
+        for error, exit_code in ((KeyboardInterrupt(), 130), (EOFError(), 2)):
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch('sys.stdin.isatty', return_value=True),
+                    patch('sys.stdout.isatty', return_value=True),
+                    patch('sys.stderr', new_callable=io.StringIO),
+                    self.answers('select', ['settings', 'configure']),
+                    self.answers('text', ['new-id']),
+                    self.answers('password', [error]),
+                    self.assertLogs('Downloader'),
+                ):
+                    if isinstance(error, KeyboardInterrupt):
+                        self.assertEqual(downloader.cli([]), exit_code)
+                    else:
+                        with self.assertRaises(SystemExit) as raised:
+                            downloader.cli([])
+                        self.assertEqual(raised.exception.code, exit_code)
+                self.assertFalse(Path('.env').exists())
+
+    def test_nested_settings_navigation_with_real_keyboard_input(self):
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        original_select = downloader.questionary.select
+        selections = iter((5, 1, 1, 5, 6))
+        with create_pipe_input() as keyboard:
+            def select(*args, **kwargs):
+                keyboard.send_text('\x1b[B' * next(selections) + '\r')
+                return original_select(*args, input=keyboard, output=DummyOutput(), **kwargs)
+
+            with patch.object(downloader.questionary, 'select', side_effect=select) as prompts:
+                self.assertEqual(downloader.terminal_menu(30), 0)
+        self.assertEqual(prompts.call_count, 5)
+        self.assertEqual(dotenv_values('.env'), {'MAX_RETRIES': '1'})
+        self.assertEqual(downloader.retry_limit(), 1)
 
     def test_first_download_prompts_for_missing_credentials(self):
         with (

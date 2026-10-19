@@ -137,7 +137,7 @@ class OutputSettingsTests(unittest.TestCase):
             self.assertEqual(downloader.download_directory(), Path.cwd() / 'new-output')
             return True
         with (patch.object(downloader, 'load_credentials', return_value=('fake-id', 'fake-secret')),
-              self.answers('select', ['download_directory', 'custom', 'user', 'exit']),
+              self.answers('select', ['settings', 'download_directory', 'custom', 'back', 'user', 'exit']),
               self.answers('text', ['new-output', 'reader@example.invalid']),
               patch.object(downloader, 'download_users', side_effect=download) as users):
             self.assertEqual(downloader.terminal_menu(10), 0)

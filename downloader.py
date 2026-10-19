@@ -25,6 +25,7 @@ import stat
 import sys
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -46,7 +47,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.9.0'
+VERSION = '0.10.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 TOKEN_LIFETIME = 3600.0
@@ -694,6 +695,13 @@ class ProgressReporter:
             details = f" | путей подготовлено: {counts.get('paths', 0)}"
         elif phase == 'создание папок':
             details = f" | создано или уже существует: {counts.get('prepared', 0)}, ошибок: {counts.get('failed_directories', 0)}"
+        elif phase == 'оценка объёма':
+            details = (
+                f" | проверено файлов: {counts.get('checked', 0)}/{total}"
+                f" | к загрузке: {counts.get('estimated_files', 0)}"
+                f" ({counts.get('estimated_bytes', 0) / 1024 ** 2:.2f} МБ)"
+                f" | уже скачано: {counts.get('skipped_existing', 0)}, ошибок: {counts.get('estimate_errors', 0)}"
+            )
         elif phase == 'скачивание':
             downloaded, failed = counts.get('downloaded', 0), counts.get('failed_files', 0)
             skipped = counts.get('skipped', 0)
@@ -826,11 +834,15 @@ def windows_long_path(path: str) -> str:
 
 
 class LocalPaths:
-    def __init__(self, root: Path, *, persistent: bool = False, state_dir: Path | None = None):
+    def __init__(
+        self, root: Path, *, persistent: bool = False, state_dir: Path | None = None,
+        read_only: bool = False,
+    ):
         self.root = root
         self._paths: dict[tuple[str, ...], Path] = {(): root}
         self._used: set[tuple[Path, str]] = set()
         self._persistent = persistent
+        self._read_only = read_only
         self._loaded = False
         self._lock_file = None
         self._protect_existing: set[tuple[str, ...]] = set()
@@ -844,6 +856,9 @@ class LocalPaths:
         if not self._persistent:
             return self
         ensure_safe_path(self._state_dir, self._state_dir.parent, include_leaf=True)
+        if self._read_only:
+            self._load()
+            return self
         self._state_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._state_path.with_suffix('.lock')
         ensure_safe_path(lock_path, self._state_dir, include_leaf=True)
@@ -921,6 +936,8 @@ class LocalPaths:
             self.get('/' + '/'.join(key))
 
     def save(self) -> None:
+        if self._read_only:
+            raise RuntimeError('Read-only path mapping cannot be saved')
         if not self._persistent:
             return
         if self._lock_file is None:
@@ -1070,21 +1087,7 @@ async def download_user(
         log.info('Поиск файлов и папок...')
         progress.phase('поиск файлов и папок')
         listing = await list_resources(client, progress)
-        selected_files = listing.files
-        date_errors = 0
-        skipped_by_date = 0
-        if cutoff is not None:
-            selected_files = []
-            for item in listing.files:
-                modified = getattr(item, 'modified', None)
-                if not isinstance(modified, datetime) or modified.utcoffset() is None:
-                    date_errors += 1
-                    log.error('Не удалось проверить дату изменения %r: поле modified отсутствует или некорректно', item.path)
-                elif modified < cutoff:
-                    skipped_by_date += 1
-                else:
-                    selected_files.append(item)
-            log.info('По дате: пропущено %s; ошибок %s', skipped_by_date, date_errors)
+        selected_files, skipped_by_date, date_errors = filter_files_by_date(listing.files, cutoff)
         files_count = len(selected_files)
         progress.total_files(files_count)
         log.info('Найдено папок: %s; файлов к скачиванию: %s; ошибок чтения: %s',
@@ -1156,6 +1159,137 @@ async def download_user(
             round((end_time - start_time) / 60, 2), listing.failed_directories, date_summary,
         )
         return successful == files_count and failed_directories == 0 and listing.failed_directories == 0 and date_errors == 0
+
+
+def filter_files_by_date(
+    files: list[ResourceObject], cutoff: datetime | None,
+) -> tuple[list[ResourceObject], int, int]:
+    if cutoff is None:
+        return files, 0, 0
+    selected = []
+    skipped = errors = 0
+    for item in files:
+        modified = getattr(item, 'modified', None)
+        if not isinstance(modified, datetime) or modified.utcoffset() is None:
+            errors += 1
+            log.error('Не удалось проверить дату изменения %r: поле modified отсутствует или некорректно', item.path)
+        elif modified < cutoff:
+            skipped += 1
+        else:
+            selected.append(item)
+    log.info('По дате: пропущено %s; ошибок %s', skipped, errors)
+    return selected, skipped, errors
+
+
+@dataclass
+class VolumeEstimate:
+    email: str
+    vdhash: str | None
+    cutoff: datetime | None
+    files: int = 0
+    bytes: int = 0
+    skipped_existing: int = 0
+    skipped_by_date: int = 0
+    errors: int = 0
+    error: str = ''
+
+    @property
+    def complete(self) -> bool:
+        return self.errors == 0
+
+    def record_error(self, message: str, count: int = 1) -> None:
+        self.errors += count
+        if not self.error:
+            self.error = message
+
+
+async def estimate_disk(
+    email: str, output_dir: Path, status_interval: float = STATUS_INTERVAL,
+    vdhash: str | None = None,
+) -> VolumeEstimate:
+    result = VolumeEstimate(email, vdhash, modified_since())
+    label = f'Общий Диск {vdhash} ({email})' if vdhash is not None else email
+    with ProgressReporter(label, status_interval) as progress:
+        try:
+            root = Path(os.path.abspath(output_dir))
+            if os.name == 'nt':
+                root = Path(windows_long_path(str(root)))
+            ensure_safe_path(root, root, include_leaf=True)
+            with LocalPaths(root, persistent=True, read_only=True) as local_paths:
+                client_id, client_secret = load_credentials()
+                if not client_id or not client_secret:
+                    raise ValueError('CLIENT_ID or CLIENT_SECRET is not in environment or .env file')
+                tokens = ServiceTokenManager(client_id, client_secret, email)
+                token = await tokens.get_token()
+                if vdhash is not None:
+                    client = SharedDiskClient(token, vdhash, tokens)
+                else:
+                    client = AsyncClient(token=token, session=disk_session(tokens), default_args={'n_retries': 0})
+
+                async with client, tokens:
+                    progress.phase('проверка токена')
+                    if not await with_retries(client.check_token, 'проверка токена'):
+                        result.record_error('Проверка сервисного токена завершилась ошибкой')
+                        log.error('%s: %s', label, result.error)
+                        return result
+                    log.info('Оценка объёма: %s', label)
+                    if result.cutoff is not None:
+                        log.info('Дата изменения от: %s', result.cutoff.isoformat())
+                    progress.phase('поиск файлов и папок')
+                    listing = await list_resources(client, progress)
+                    if listing.failed_directories:
+                        result.record_error('Не удалось прочитать часть папок', listing.failed_directories)
+                    selected, result.skipped_by_date, date_errors = filter_files_by_date(listing.files, result.cutoff)
+                    if date_errors:
+                        result.record_error('Не удалось определить дату изменения части файлов', date_errors)
+                    progress.phase('подготовка путей')
+                    remotes = sorted(item.path for item in listing.directories + listing.files)
+                    local_paths.prepare(remotes)
+                    for remote in remotes:
+                        progress.current(remote)
+                        local_paths.get(remote)
+                        progress.count(paths=1)
+                    progress.total_files(len(selected))
+                    progress.phase('оценка объёма')
+                    progress.count(estimate_errors=result.errors)
+                    for item in selected:
+                        progress.current(item.path)
+                        try:
+                            local_path = local_paths.get(item.path)
+                            ensure_safe_path(local_path, root, include_leaf=True)
+                            complete = await check_local_file(local_path, item)
+                            ensure_safe_path(local_path, root, include_leaf=True)
+                            if complete is None:
+                                result.record_error('Недостаточно данных для проверки локального файла')
+                                progress.count(estimate_errors=1)
+                                log.error('Нельзя проверить существующий файл без размера или контрольной суммы: %r', str(local_path))
+                                continue
+                            if complete:
+                                result.skipped_existing += 1
+                                progress.count(skipped_existing=1)
+                            else:
+                                result.files += 1
+                                progress.count(estimated_files=1)
+                                size = getattr(item, 'size', None)
+                                if type(size) is not int or size < 0:
+                                    result.record_error('Размер части файлов отсутствует или некорректен')
+                                    progress.count(estimate_errors=1)
+                                    log.error('Не удалось определить размер файла %r: поле size отсутствует или некорректно', item.path)
+                                    continue
+                                result.bytes += size
+                                progress.count(estimated_bytes=size)
+                        except Exception as error:
+                            reason = sanitized_error(error)
+                            result.record_error(f'Не удалось оценить файл {item.path!r}: {reason}')
+                            progress.count(estimate_errors=1)
+                            log.error('Не удалось оценить файл %r (%s)', item.path, reason)
+                        finally:
+                            progress.count(checked=1)
+        except Exception as error:
+            reason = sanitized_error(error)
+            result.record_error(f'Оценка не завершена: {reason}')
+            log.error('Не удалось завершить оценку %s (%s)', label, reason)
+    return result
 
 
 async def download_users(users: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
@@ -1539,6 +1673,139 @@ def configure_connection() -> None:
     print(f'Проверка сертификатов: {state}. Настройка сохранена в {Path.cwd() / ".env"}')
 
 
+def settings_menu() -> None:
+    actions = {
+        'configure': configure_credentials,
+        'retries': configure_retries,
+        'download_directory': configure_download_directory,
+        'modified_since': configure_modified_since,
+        'connection': configure_connection,
+    }
+    choices = [
+        questionary.Choice('Настроить CLIENT_ID и CLIENT_SECRET', 'configure'),
+        questionary.Choice('Настроить количество повторов (retry)', 'retries'),
+        questionary.Choice('Настроить папку загрузки', 'download_directory'),
+        questionary.Choice('Настроить дату начала выгрузки', 'modified_since'),
+        questionary.Choice('Настройки соединения', 'connection'),
+        questionary.Choice('Назад', 'back'),
+    ]
+    while True:
+        action = questionary.select('Настройки:', choices=choices,
+                                    instruction='(↑/↓ — выбор, Enter — подтвердить)').unsafe_ask()
+        if action == 'back':
+            return
+        try:
+            if action not in actions:
+                raise ValueError('Неизвестный пункт настроек')
+            actions[action]()
+        except UnicodeError:
+            print('Не удалось прочитать файл: требуется UTF-8.')
+        except ValueError as error:
+            print(str(error))
+        except OSError as error:
+            print(f'Ошибка доступа к файлу ({type(error).__name__}).')
+
+
+def format_volume(size: int) -> str:
+    for index, unit in enumerate(('Б', 'КБ', 'МБ', 'ГБ', 'ТБ', 'ПБ')):
+        if size < 1024 ** (index + 1) or unit == 'ПБ':
+            return f'{size / 1024 ** index:.2f} {unit}'
+    raise ValueError('Некорректный объём')
+
+
+def estimate_csv_cell(value: str | int) -> str | int:
+    if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')):
+        return "'" + value
+    return value
+
+
+async def estimate_disks(
+    identifiers: list[str], status_interval: float = STATUS_INTERVAL,
+    *, reader_email: str | None = None, csv_report: bool = False,
+) -> bool:
+    try:
+        return await collect_estimates(identifiers, status_interval, reader_email=reader_email, csv_report=csv_report)
+    except OSError as error:
+        log.error('Оценка не завершена: ошибка доступа к файлу (%s)', sanitized_error(error))
+        return False
+
+
+async def collect_estimates(
+    identifiers: list[str], status_interval: float = STATUS_INTERVAL,
+    *, reader_email: str | None = None, csv_report: bool = False,
+) -> bool:
+    cutoff = modified_since()
+    report_connection_settings()
+    report_path = None
+    report = None
+    if csv_report:
+        directory = Path.cwd() / 'estimates'
+        ensure_safe_path(directory, Path.cwd(), include_leaf=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        report_path = directory / datetime.now().strftime('estimate_%Y-%m-%d_%H-%M-%S_%f.csv')
+        report = report_path.open('x', encoding='utf-8-sig', newline='')
+    with report if report is not None else nullcontext() as output:
+        writer = csv.writer(output, delimiter=';') if output is not None else None
+        if writer is not None:
+            writer.writerow([
+                'Тип диска', 'Email', 'VDHASH', 'Дата изменения от', 'Файлов к загрузке',
+                'Объем к загрузке, байт', 'Уже скачано, файлов', 'Пропущено по дате, файлов',
+                'Статус', 'Ошибок', 'Описание',
+            ])
+            output.flush()
+            log.info('Отчёт оценки: %s', report_path)
+        destinations: dict[str, Path] = {}
+        destination_error = ''
+        try:
+            base = download_directory().resolve()
+            if reader_email is not None:
+                shared_root = base / 'shared'
+                ensure_safe_path(shared_root, base, include_leaf=True)
+                base = shared_root
+            with LocalPaths(base, persistent=True, state_dir=base / '.disk-downloader', read_only=True) as paths:
+                paths.prepare('/' + identifier for identifier in identifiers)
+                destinations = {identifier: paths.get('/' + identifier) for identifier in identifiers}
+        except Exception as error:
+            destination_error = 'Не удалось проверить папку загрузки: ' + sanitized_error(error)
+            log.error('%s', destination_error)
+        successful = 0
+        for position, identifier in enumerate(identifiers, 1):
+            email = reader_email if reader_email is not None else identifier
+            vdhash = identifier if reader_email is not None else None
+            label = f'Общий Диск {vdhash} ({email})' if vdhash is not None else email
+            log.info('Оценка [%s/%s]: %s', position, len(identifiers), label)
+            if destination_error:
+                result = VolumeEstimate(email, vdhash, cutoff, errors=1, error=destination_error)
+            else:
+                try:
+                    result = await estimate_disk(email, destinations[identifier], status_interval, vdhash)
+                except Exception as error:
+                    description = sanitized_error(error)
+                    log.error('Не удалось оценить %s (%s)', label, description)
+                    result = VolumeEstimate(email, vdhash, cutoff, errors=1, error=description)
+            status = 'готово' if result.complete else 'неполная оценка'
+            successful += result.complete
+            if writer is not None:
+                writer.writerow(map(estimate_csv_cell, [
+                    'общий' if vdhash is not None else 'личный', email, vdhash or '',
+                    result.cutoff.isoformat() if result.cutoff is not None else '',
+                    result.files, result.bytes, result.skipped_existing, result.skipped_by_date,
+                    status, result.errors, result.error,
+                ]))
+                output.flush()
+            else:
+                log.info('Оценка %s: %s\nФайлов к загрузке: %s | объём: %s (%s байт)',
+                         label, status, result.files, format_volume(result.bytes), result.bytes)
+                log.info('Уже скачано: %s | пропущено по дате: %s | ошибок: %s',
+                         result.skipped_existing, result.skipped_by_date, result.errors)
+                if result.error:
+                    log.error('Причина неполной оценки: %s', result.error)
+        if report_path is not None:
+            log.info('Отчёт сохранён: %s | дисков: %s; с полной оценкой: %s; с ошибками: %s',
+                     report_path, len(identifiers), successful, len(identifiers) - successful)
+        return successful == len(identifiers)
+
+
 def terminal_menu(status_interval: float) -> int:
     result = 0
     choices = [
@@ -1546,11 +1813,8 @@ def terminal_menu(status_interval: float) -> int:
         questionary.Choice('Личные Диски — список email из CSV', 'users'),
         questionary.Choice('Общий Диск — один VDHASH', 'shared'),
         questionary.Choice('Общие Диски — список VDHASH из CSV', 'shared_csv'),
-        questionary.Choice('Настроить CLIENT_ID и CLIENT_SECRET', 'configure'),
-        questionary.Choice('Настроить количество повторов (retry)', 'retries'),
-        questionary.Choice('Настроить папку загрузки', 'download_directory'),
-        questionary.Choice('Настроить дату начала выгрузки', 'modified_since'),
-        questionary.Choice('Настройки соединения', 'connection'),
+        questionary.Choice('Оценить объём загрузки', 'estimate'),
+        questionary.Choice('Настройки', 'settings'),
         questionary.Choice('Выход', 'exit'),
     ]
     while True:
@@ -1580,21 +1844,16 @@ def terminal_menu(status_interval: float) -> int:
         if action == 'exit':
             return result
         try:
-            if action == 'configure':
-                configure_credentials()
+            if action == 'settings':
+                settings_menu()
                 continue
-            if action == 'retries':
-                configure_retries()
-                continue
-            if action == 'download_directory':
-                configure_download_directory()
-                continue
-            if action == 'modified_since':
-                configure_modified_since()
-                continue
-            if action == 'connection':
-                configure_connection()
-                continue
+            estimate = action == 'estimate'
+            if estimate:
+                action = questionary.select('Оценить объём загрузки:', choices=[
+                    *choices[:4], questionary.Choice('Назад', 'back'),
+                ], instruction='(↑/↓ — выбор, Enter — подтвердить)').unsafe_ask()
+                if action == 'back':
+                    continue
             retry_limit()
             download_directory()
             modified_since()
@@ -1615,7 +1874,14 @@ def terminal_menu(status_interval: float) -> int:
                 raise ValueError('Неизвестный пункт меню')
             if not configured:
                 configure_credentials()
-            if action in ('user', 'users'):
+            if estimate:
+                completed = asyncio.run(estimate_disks(
+                    users if action in ('user', 'users') else vdhashes,
+                    status_interval=status_interval,
+                    reader_email=email if action in ('shared', 'shared_csv') else None,
+                    csv_report=action in ('users', 'shared_csv'),
+                ))
+            elif action in ('user', 'users'):
                 completed = asyncio.run(download_users(users, status_interval=status_interval))
             else:
                 completed = asyncio.run(download_shared_disks(email, vdhashes, status_interval=status_interval))
@@ -1639,6 +1905,8 @@ def run_cli(argv: list[str] | None = None) -> int:
     modes.add_argument('--vdhash-csv', type=Path, metavar='PATH', help='UTF-8 CSV with a VDHASH column; requires --email')
     modes.add_argument('--configure', action='store_true', help='Configure CLIENT_ID and CLIENT_SECRET interactively')
     parser.add_argument('--email', help='Personal disk owner or shared disk reader email')
+    parser.add_argument('--estimate', action='store_true',
+                        help='Оценить объём без скачивания; для списка CSV сохранить отчёт в estimates')
     parser.add_argument('--status-interval', type=positive_interval, default=STATUS_INTERVAL, metavar='SECONDS',
                         help=f'Progress update interval in seconds (default: {STATUS_INTERVAL:g})')
     args = parser.parse_args(argv)
@@ -1647,6 +1915,8 @@ def run_cli(argv: list[str] | None = None) -> int:
     shared = args.vdhash is not None or args.vdhash_csv is not None
     if shared and args.email is None:
         parser.error('--email is required: use an employee with read access to the shared disks')
+    if args.estimate and (args.configure or not any((args.email is not None, args.csv is not None, shared))):
+        parser.error('--estimate требует --email, --csv или --email с --vdhash / --vdhash-csv')
     interactive = args.configure or not any((args.email is not None, args.csv is not None, shared))
     if interactive and not (sys.stdin.isatty() and sys.stdout.isatty()):
         parser.error('Menu requires a terminal; use --email, --csv or --email with --vdhash / --vdhash-csv')
@@ -1664,8 +1934,17 @@ def run_cli(argv: list[str] | None = None) -> int:
         if shared:
             email = validate_email(args.email)
             vdhashes = read_shared_disks_csv(args.vdhash_csv) if args.vdhash_csv is not None else [validate_vdhash(args.vdhash)]
+            if args.estimate:
+                return 0 if asyncio.run(estimate_disks(
+                    vdhashes, status_interval=args.status_interval, reader_email=email,
+                    csv_report=args.vdhash_csv is not None,
+                )) else 1
             return 0 if asyncio.run(download_shared_disks(email, vdhashes, status_interval=args.status_interval)) else 1
         users = read_users_csv(args.csv) if args.csv is not None else [validate_email(args.email)]
+        if args.estimate:
+            return 0 if asyncio.run(estimate_disks(
+                users, status_interval=args.status_interval, csv_report=args.csv is not None,
+            )) else 1
         return 0 if asyncio.run(download_users(users, status_interval=args.status_interval)) else 1
     except UnicodeError:
         parser.error('CSV and .env must be encoded as UTF-8')
