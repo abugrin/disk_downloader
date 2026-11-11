@@ -254,6 +254,7 @@ class MenuTests(unittest.TestCase):
                     self.answers('select', ['configure', 'connection', 'back']) as select,
                     patch.object(downloader, 'configure_credentials', side_effect=error) as credentials,
                     patch.object(downloader, 'configure_connection') as connection,
+                    patch.object(downloader.log_handler, 'stream', self.output),
                 ):
                     downloader.settings_menu()
                 credentials.assert_called_once_with()

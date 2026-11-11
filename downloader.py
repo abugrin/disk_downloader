@@ -47,7 +47,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.10.0'
+VERSION = '0.11.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 TOKEN_LIFETIME = 3600.0
@@ -96,7 +96,25 @@ class PathMappingError(ValueError):
     pass
 
 
-class DestinationBusyError(OSError):
+class DestinationLockError(OSError):
+    def __init__(self, root: Path, lock_path: Path, phase: str):
+        self.root = root
+        self.lock_path = lock_path
+        self.phase = phase
+        explanation = (
+            'Возможен другой запуск в этой папке, в том числе с другой машины, '
+            'либо ограничения доступа/SMB.'
+            if phase == 'захват блокировки'
+            else 'Проверьте доступ на запись к служебной папке и доступность файловой системы.'
+        )
+        self.diagnostic = (
+            f'этап: {phase}; область блокировки: {str(root)!r}; '
+            f'файл блокировки: {str(lock_path)!r}; {explanation}'
+        )
+        super().__init__(self.diagnostic)
+
+
+class DestinationBusyError(DestinationLockError):
     pass
 
 
@@ -243,6 +261,40 @@ def exception_chain(error: BaseException) -> list[BaseException]:
     return result
 
 
+async def mark_request_started(request: httpx.Request) -> None:
+    request.extensions['downloader_started'] = monotonic()
+
+
+def network_request_diagnostic(request: httpx.Request, redactor: DiagnosticRedactor) -> list[str]:
+    host = request.url.host
+    port = request.url.port or (443 if request.url.scheme == 'https' else 80)
+    if host == 'oauth.yandex.ru':
+        operation = 'получение токена'
+    elif host == 'cloud-api.yandex.net':
+        operation = ('получение ссылки на скачивание' if request.url.path.endswith('/download')
+                     else 'запрос API Диска')
+    else:
+        operation = 'скачивание содержимого'
+    address = f'[{host}]:{port}' if ':' in host else f'{host}:{port}'
+    details = [f'операция={operation}', 'метод=' + redactor.text(request.method),
+               'узел=' + redactor.text(address)]
+    started = request.extensions.get('downloader_started')
+    if type(started) in (int, float) and math.isfinite(started):
+        details.append(f'прошло={max(0.0, monotonic() - started):.2f} с')
+    timeouts = request.extensions.get('timeout')
+    if isinstance(timeouts, dict):
+        for key, label in (('connect', 'подключение'), ('read', 'чтение'),
+                           ('write', 'запись'), ('pool', 'пул')):
+            if key not in timeouts:
+                continue
+            value = timeouts[key]
+            if value is None:
+                details.append(f'{label}=без ограничения')
+            elif type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                details.append(f'{label}={value:g} с')
+    return details
+
+
 def sanitized_error(error: BaseException, *, known_secrets: Iterable[str] = ()) -> str:
     details = [type(error).__name__]
     chain = exception_chain(error)
@@ -255,6 +307,7 @@ def sanitized_error(error: BaseException, *, known_secrets: Iterable[str] = ()) 
         network_causes = {id(cause) for item in network_roots for cause in exception_chain(item)}
         redactor.secrets.update(known_secrets)
         redactor.secrets.add(os.getenv('CLIENT_SECRET', ''))
+        requests: dict[int, httpx.Request] = {}
         for item in chain:
             try:
                 request = getattr(item, 'request', None)
@@ -262,6 +315,15 @@ def sanitized_error(error: BaseException, *, known_secrets: Iterable[str] = ()) 
                 request = None
             if isinstance(request, httpx.Request):
                 redactor.collect_request(request)
+                requests[id(request)] = request
+        for request in requests.values():
+            details.extend(network_request_diagnostic(request, redactor))
+        for kind, phase in ((httpx.ConnectTimeout, 'подключение (TCP/TLS)'),
+                            (httpx.ReadTimeout, 'чтение ответа'),
+                            (httpx.WriteTimeout, 'отправка запроса'),
+                            (httpx.PoolTimeout, 'ожидание свободного соединения')):
+            if any(isinstance(item, kind) for item in chain):
+                details.append(f'этап={phase}')
         for item in chain:
             details.append(type(item).__name__)
             if (id(item) in network_causes and not isinstance(item, BaseExceptionGroup)
@@ -301,8 +363,16 @@ def sanitized_error(error: BaseException, *, known_secrets: Iterable[str] = ()) 
             details.append(code)
         if isinstance(response, httpx.Response):
             details.append(response_diagnostic(response))
-        if isinstance(current, OSError) and isinstance(current.errno, int):
-            details.append(f'errno={current.errno}')
+        if isinstance(current, OSError):
+            details.append(type(current).__name__)
+            for name in ('errno', 'winerror'):
+                value = getattr(current, name, None)
+                if type(value) is int:
+                    details.append(f'{name}={value}')
+        if isinstance(current, DestinationLockError):
+            redactor.secrets.update(known_secrets)
+            redactor.secrets.add(os.getenv('CLIENT_SECRET', ''))
+            details.append(redactor.text(current.diagnostic))
         if isinstance(current, TokenRefreshError):
             details.append(current.diagnostic)
     message = '; '.join(dict.fromkeys(value for value in details if value))
@@ -392,7 +462,8 @@ class ServiceToken:
 
 async def get_service_token(client_id: str, client_secret: str, email: str) -> ServiceToken:
     async with httpx.AsyncClient(timeout=30, verify=tls_verification(),
-                                 event_hooks={'response': [check_transient_response]}) as client:
+                                 event_hooks={'request': [mark_request_started],
+                                              'response': [check_transient_response]}) as client:
         async def request() -> ServiceToken:
             started = monotonic()
             started_wall = time()
@@ -538,9 +609,9 @@ class ServiceTokenManager:
 
 
 def disk_session(tokens: ServiceTokenManager | None = None) -> AsyncHTTPXSession:
-    hooks = {'response': [check_transient_response]}
+    hooks = {'request': [mark_request_started], 'response': [check_transient_response]}
     if tokens is not None:
-        hooks['request'] = [tokens.authorize]
+        hooks['request'].insert(0, tokens.authorize)
     return AsyncHTTPXSession(verify=tls_verification(), event_hooks=hooks)
 
 
@@ -859,25 +930,40 @@ class LocalPaths:
         if self._read_only:
             self._load()
             return self
-        self._state_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._state_path.with_suffix('.lock')
-        ensure_safe_path(lock_path, self._state_dir, include_leaf=True)
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        self._lock_file = os.fdopen(descriptor, 'r+b')
         try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            ensure_safe_path(lock_path, self._state_dir, include_leaf=True)
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             try:
-                if os.name == 'nt':
-                    import msvcrt
+                self._lock_file = os.fdopen(descriptor, 'r+b')
+            except BaseException:
+                os.close(descriptor)
+                raise
+        except UnsafeDestinationError:
+            raise
+        except OSError as error:
+            raise DestinationLockError(self.root, lock_path, 'подготовка файла блокировки') from error
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                try:
                     if self._lock_file.seek(0, os.SEEK_END) == 0:
                         self._lock_file.write(b'\0')
                         self._lock_file.flush()
                     self._lock_file.seek(0)
+                except OSError as error:
+                    raise DestinationLockError(self.root, lock_path, 'подготовка файла блокировки') from error
+            try:
+                if os.name == 'nt':
                     msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
                     fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (BlockingIOError, PermissionError) as error:
-                raise DestinationBusyError('Download directory is locked by another process') from error
+                raise DestinationBusyError(self.root, lock_path, 'захват блокировки') from error
+            except OSError as error:
+                raise DestinationLockError(self.root, lock_path, 'захват блокировки') from error
             self._load()
         except BaseException:
             self._lock_file.close()
@@ -1703,7 +1789,7 @@ def settings_menu() -> None:
         except ValueError as error:
             print(str(error))
         except OSError as error:
-            print(f'Ошибка доступа к файлу ({type(error).__name__}).')
+            log.error('Ошибка доступа к файлу (%s)', sanitized_error(error))
 
 
 def format_volume(size: int) -> str:
@@ -1894,7 +1980,9 @@ def terminal_menu(status_interval: float) -> int:
         except ValueError as error:
             print(str(error))
         except OSError as error:
-            print(f'Ошибка доступа к файлу ({type(error).__name__}).')
+            log.error('Ошибка доступа к файлу (%s)', sanitized_error(error))
+            if isinstance(error, DestinationLockError):
+                result = 1
 
 
 def run_cli(argv: list[str] | None = None) -> int:
@@ -1949,6 +2037,7 @@ def run_cli(argv: list[str] | None = None) -> int:
     except UnicodeError:
         parser.error('CSV and .env must be encoded as UTF-8')
     except OSError as error:
+        log.error('Ошибка доступа к файлу (%s)', sanitized_error(error))
         parser.error(f'Cannot access file ({type(error).__name__})')
     except csv.Error:
         parser.error('Invalid CSV syntax')
