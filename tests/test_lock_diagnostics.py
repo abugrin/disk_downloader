@@ -67,25 +67,25 @@ class LockDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(paths._lock_file)
         self.assertEqual(windows.locking.call_args.args[1:], (2, 1))
 
-    def test_windows_lock_file_write_failure_is_not_reported_as_contention(self):
-        cause = PermissionError(errno.EACCES, 'private write failure')
+    def test_windows_lock_file_seek_failure_is_not_reported_as_contention(self):
+        cause = PermissionError(errno.EACCES, 'private seek failure')
         opened = []
         real_fdopen = os.fdopen
 
-        class UnwritableFile:
+        class UnseekableFile:
             def __init__(self, file):
                 self.file = file
 
             def __getattr__(self, name):
                 return getattr(self.file, name)
 
-            def write(self, data):
+            def seek(self, offset, whence=0):
                 raise cause
 
         def fdopen(descriptor, mode):
             file = real_fdopen(descriptor, mode)
             opened.append(file)
-            return UnwritableFile(file)
+            return UnseekableFile(file)
 
         windows_os = WindowsOS()
         windows_os.fdopen = fdopen
@@ -115,6 +115,7 @@ class LockDiagnosticsTests(unittest.TestCase):
     def test_terminal_lock_failure_is_logged_to_file_and_returns_failure(self):
         with (
             self.mapping(),
+            patch.object(downloader, 'SHARED_LOCK_TIMEOUT', 0),
             patch('sys.stdout', new_callable=io.StringIO),
             patch('sys.stdin.isatty', return_value=True),
             patch('sys.stdout.isatty', return_value=True),
@@ -135,7 +136,8 @@ class LockDiagnosticsTests(unittest.TestCase):
         self.assertIn('код: 1', content)
 
     def test_cli_lock_failure_reaches_log_before_argument_error(self):
-        with self.mapping(), patch('sys.stderr', new_callable=io.StringIO):
+        with (self.mapping(), patch('sys.stderr', new_callable=io.StringIO),
+              patch.object(downloader, 'SHARED_LOCK_TIMEOUT', 0)):
             with self.assertRaises(SystemExit) as raised:
                 downloader.cli(['--email', 'reader@example.invalid', '--vdhash', 'AnotherDisk'])
         self.assertNotEqual(raised.exception.code, 0)

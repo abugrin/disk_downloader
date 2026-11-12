@@ -11,6 +11,7 @@
 import argparse
 import asyncio
 import csv
+import errno
 import hashlib
 import json
 import logging
@@ -47,9 +48,11 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.11.0'
+VERSION = '0.12.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
+SHARED_LOCK_TIMEOUT = 30.0
+SHARED_LOCK_POLL_INTERVAL = 0.2
 TOKEN_LIFETIME = 3600.0
 TOKEN_REFRESH_MARGIN = 300.0
 TOKEN_REFRESH_RETRY_INTERVAL = 30.0
@@ -948,9 +951,6 @@ class LocalPaths:
             if os.name == 'nt':
                 import msvcrt
                 try:
-                    if self._lock_file.seek(0, os.SEEK_END) == 0:
-                        self._lock_file.write(b'\0')
-                        self._lock_file.flush()
                     self._lock_file.seek(0)
                 except OSError as error:
                     raise DestinationLockError(self.root, lock_path, 'подготовка файла блокировки') from error
@@ -1402,32 +1402,60 @@ async def download_users(users: list[str], status_interval: float = STATUS_INTER
         return successful == len(users)
 
 
+async def prepare_shared_destinations(root: Path, vdhashes: list[str]) -> list[tuple[str, Path]]:
+    deadline = monotonic() + SHARED_LOCK_TIMEOUT
+    waiting = False
+    while True:
+        try:
+            with LocalPaths(root, persistent=True, state_dir=root / '.disk-downloader') as destinations:
+                destinations.prepare('/' + vdhash for vdhash in vdhashes)
+                result = [(vdhash, destinations.get('/' + vdhash)) for vdhash in vdhashes]
+                destinations.save()
+                return result
+        except DestinationBusyError as error:
+            cause = error.__cause__
+            if not isinstance(cause, OSError):
+                raise
+            if os.name == 'nt':
+                winerror = getattr(cause, 'winerror', None)
+                busy = winerror == 33 or (winerror is None and cause.errno == errno.EACCES)
+            else:
+                busy = cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+            if not busy:
+                raise
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                log.error('Истекло время ожидания общей блокировки (%.0f с): %r', SHARED_LOCK_TIMEOUT, str(root))
+                raise
+            if not waiting:
+                log.info('Общая карта папок занята; ожидание до %.0f с: %r', SHARED_LOCK_TIMEOUT, str(root))
+                waiting = True
+            await asyncio.sleep(min(SHARED_LOCK_POLL_INTERVAL, remaining))
+
+
 async def download_shared_disks(email: str, vdhashes: list[str], status_interval: float = STATUS_INTERVAL) -> bool:
     modified_since()
     report_connection_settings()
     base = download_directory().resolve()
     shared_root = base / 'shared'
     ensure_safe_path(shared_root, base, include_leaf=True)
-    with LocalPaths(shared_root, persistent=True, state_dir=shared_root / '.disk-downloader') as destinations:
-        destinations.prepare('/' + vdhash for vdhash in vdhashes)
-        destinations.save()
-        successful = 0
-        for position, vdhash in enumerate(vdhashes, 1):
-            log.info('Общий Диск [%s/%s]: %s (через %s)', position, len(vdhashes), vdhash, email)
-            try:
-                ensure_safe_path(destinations.get('/' + vdhash), shared_root, include_leaf=True)
-                completed = await main(email, output_dir=destinations.get('/' + vdhash),
-                                       status_interval=status_interval, vdhash=vdhash)
-            except Exception as error:
-                log.error('Ошибка выгрузки Общего Диска %s (%s)', vdhash, sanitized_error(error))
-                completed = False
-            if completed:
-                successful += 1
-            else:
-                log.error('Выгрузка Общего Диска не завершена: %s', vdhash)
-        log.info('Общих Дисков: %s; успешно: %s; с ошибками: %s',
-                 len(vdhashes), successful, len(vdhashes) - successful)
-        return successful == len(vdhashes)
+    destinations = await prepare_shared_destinations(shared_root, vdhashes)
+    successful = 0
+    for position, (vdhash, output_dir) in enumerate(destinations, 1):
+        log.info('Общий Диск [%s/%s]: %s (через %s)', position, len(vdhashes), vdhash, email)
+        try:
+            ensure_safe_path(output_dir, shared_root, include_leaf=True)
+            completed = await main(email, output_dir=output_dir, status_interval=status_interval, vdhash=vdhash)
+        except Exception as error:
+            log.error('Ошибка выгрузки Общего Диска %s (%s)', vdhash, sanitized_error(error))
+            completed = False
+        if completed:
+            successful += 1
+        else:
+            log.error('Выгрузка Общего Диска не завершена: %s', vdhash)
+    log.info('Общих Дисков: %s; успешно: %s; с ошибками: %s',
+             len(vdhashes), successful, len(vdhashes) - successful)
+    return successful == len(vdhashes)
 
 
 def matches_resource(local_path: Path, resource: ResourceObject | None, stop: Event) -> bool | None:
