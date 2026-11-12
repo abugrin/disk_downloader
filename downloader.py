@@ -48,7 +48,7 @@ from yadisk.objects import DiskInfoObject, ResourceObject
 from yadisk.sessions.async_httpx_session import AsyncHTTPXSession
 
 
-VERSION = '0.12.0'
+VERSION = '0.13.0'
 MAX_STREAMS = 10
 STATUS_INTERVAL = 30.0
 SHARED_LOCK_TIMEOUT = 30.0

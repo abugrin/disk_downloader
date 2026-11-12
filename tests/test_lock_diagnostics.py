@@ -29,7 +29,7 @@ class LockDiagnosticsTests(unittest.TestCase):
         self.enterContext(isolated_environment())
         self.console = io.StringIO()
         self.enterContext(patch.object(downloader.log_handler, 'stream', self.console))
-        self.root = Path.cwd() / 'shared'
+        self.root = Path.cwd().resolve() / 'shared'
 
     def mapping(self):
         return downloader.LocalPaths(self.root, persistent=True, state_dir=self.root / '.disk-downloader')
